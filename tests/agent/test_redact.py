@@ -1613,3 +1613,50 @@ class TestRedactForEgress:
         from agent import redact as R
         monkeypatch.setattr(R, "redact_sensitive_text", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
         assert R.redact_for_egress("sk-live-0123456789abcdef") == R.REDACTION_UNAVAILABLE
+
+
+# --- Prose-labelled credentials (incident 2026-09-26) -------------------------
+# A compaction summary leaked "*Radarr API Key:* `<32 hex>`" into a held-reply
+# owner alert. Header/env shapes were covered; a human-readable label followed
+# by markdown decoration was not.
+_PROSE_KEY = "6ed917cdee324555aab7d2717a70a015"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"- *Radarr API Key:* `{_PROSE_KEY}`",
+        f"Radarr API Key: {_PROSE_KEY}",
+        f"*API key*: `{_PROSE_KEY}`",
+        f"Access token: {_PROSE_KEY}",
+        f"Clave API: {_PROSE_KEY}",
+    ],
+)
+def test_redact_for_egress_masks_prose_labelled_credentials(text):
+    from agent.redact import redact_for_egress
+
+    assert _PROSE_KEY not in redact_for_egress(text)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "API key: pídela en el panel de Radarr.",
+        "Token: usa el que ya tienes configurado.",
+        "Password: la misma de siempre",
+    ],
+)
+def test_prose_label_pattern_ignores_non_opaque_values(text):
+    # Scoped to the new prose-label pass. (A pre-existing pass still masks the
+    # first word after some labels, e.g. "Password: *** misma" — tracked
+    # separately; not introduced here.)
+    from agent.redact import _PROSE_SECRET_LABEL_RE
+
+    assert _PROSE_SECRET_LABEL_RE.search(text) is None
+
+
+def test_prose_label_does_not_alter_plain_token_sentence():
+    from agent.redact import redact_for_egress
+
+    text = "Token: usa el que ya tienes configurado."
+    assert redact_for_egress(text) == text

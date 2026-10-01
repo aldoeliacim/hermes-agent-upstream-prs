@@ -23,7 +23,7 @@ from agent.served_model import result_model_fields
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
 # real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic", "_reply_decision_synthetic")
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -155,6 +155,38 @@ def _resolve_budget_fallback(
                     "— requesting summary...", diagnostic=True,
                 )
             final_response = agent._handle_max_iterations(messages, api_call_count)
+            from agent.turn_final_response import (
+                _INTERNAL_SUMMARY_SAFE_FAILURE,
+                internal_artifact_kind,
+            )
+            _artifact_kind = internal_artifact_kind(final_response)
+            if _artifact_kind:
+                logger.error(
+                    "Internal artifact (%s) rejected from iteration-limit fallback "
+                    "(model=%s provider=%s session=%s)",
+                    _artifact_kind,
+                    getattr(agent, "model", "") or "unknown",
+                    getattr(agent, "provider", "") or "unknown",
+                    getattr(agent, "session_id", "") or "none",
+                )
+                # handle_max_iterations appended its synthetic user request and
+                # assistant answer. Remove the exact pair before persistence.
+                if (
+                    messages
+                    and isinstance(messages[-1], dict)
+                    and messages[-1].get("role") == "assistant"
+                    and messages[-1].get("content") == final_response
+                ):
+                    messages.pop()
+                from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
+                if (
+                    messages
+                    and isinstance(messages[-1], dict)
+                    and messages[-1].get("role") == "user"
+                    and messages[-1].get("content") == MAX_ITERATIONS_SUMMARY_REQUEST
+                ):
+                    messages.pop()
+                final_response = _INTERNAL_SUMMARY_SAFE_FAILURE
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete. Only the
@@ -206,6 +238,12 @@ def _drop_transcript_scaffolding(agent, messages) -> None:
     the synthetic verification nudges go; the assistant candidate persists (#65919)."""
     agent._drop_trailing_empty_response_scaffolding(messages)
     _drop_verification_continuation_scaffolding(messages)
+    while (
+        messages
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("_internal_summary_recovery")
+    ):
+        messages.pop()
 
 
 def _recover_final_from_stream(agent, final_response, interrupted, failed) -> Tuple[Any, bool]:

@@ -849,6 +849,9 @@ class BuzzAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Buzz has no typing indicator API — no-op."""
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def send_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Best-effort reaction via buzz-cli; failures are logged, never raised."""
         if not self.cli_path or not emoji or not message_id:

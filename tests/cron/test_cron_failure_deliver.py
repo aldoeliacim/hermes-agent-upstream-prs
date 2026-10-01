@@ -111,6 +111,21 @@ def _succeeding_run_job(final="all good, here is the brief"):
     return _fake
 
 
+
+def _pin_home(monkeypatch, chat_id):
+    """Make ``chat_id`` the operator's slack home channel.
+
+    These tests are about failure ROUTING. A failure notice keeps its diagnostics only on
+    the operator's home channel; any other target gets the neutral outcome-only line
+    (cron.scheduler_delivery._NON_OWNER_CRON_FAILURE, pinned in
+    test_non_home_failure_notice_is_outcome_only). Pin the destination as home so the
+    routing assertions see the diagnostic notice.
+    """
+    from cron import scheduler_delivery as sd
+
+    monkeypatch.setattr(sd, "_get_home_target_chat_id", lambda p: chat_id if p == "slack" else "")
+    monkeypatch.setattr(sd, "_get_home_target_thread_id", lambda _p: "")
+
 class TestFailureDeliverRouting:
     def test_failure_without_failure_deliver_goes_to_deliver_targets(
         self, run_env, monkeypatch
@@ -119,6 +134,7 @@ class TestFailureDeliverRouting:
         the job's deliver targets."""
         monkeypatch.setattr(s, "run_job", _failing_run_job())
 
+        _pin_home(monkeypatch, "D0MAIN")
         s.run_one_job({"id": "j1", "name": "scout", "deliver": "slack:D0MAIN"})
 
         assert [c["chat_id"] for c in run_env["send"]] == ["D0MAIN"]
@@ -150,6 +166,7 @@ class TestFailureDeliverRouting:
         """(c) failure_deliver set to a different target: the failure notice
         goes THERE, and nothing goes to the deliver target."""
         monkeypatch.setattr(s, "run_job", _failing_run_job())
+        _pin_home(monkeypatch, "D0ALERTS")
 
         s.run_one_job({
             "id": "j3", "name": "scout",

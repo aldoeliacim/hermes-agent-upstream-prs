@@ -137,6 +137,7 @@ def _coerce_dict(value: Any) -> Dict[str, Any]:
 # "pair" DMs a pairing code, "ignore" drops silently, "decline" sends one polite refusal then goes
 # silent toward that sender for gateway.pairing.DECLINE_DEDUPE_SECONDS (#88028).
 UNAUTHORIZED_DM_BEHAVIORS = {"pair", "ignore", "decline"}
+REPLY_GATE_MODES = {"prompt", "tool"}
 DEFAULT_UNAUTHORIZED_DM_DECLINE_MESSAGE = (
     "Hi! I'm a personal assistant and can only chat with my owner, so I can't help you directly. Sorry!"
 )
@@ -572,6 +573,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
 _TOPLEVEL_BOOL_DEFAULTS = {
     "write_sessions_json": True, "always_log_local": True, "filter_silence_narration": True,
     "group_sessions_per_user": True, "thread_sessions_per_user": False,
+    "reply_gate_tool_fallback": True,
 }
 
 
@@ -591,6 +593,16 @@ class GatewayConfig:
     # Drop outbound "silence narration" (*(silent)*, 🔇, a bare ".") that ping-pongs in bot-to-bot
     # channels; a substrate guard that survives prompt drift.
     filter_silence_narration: bool = True
+    # Reply-gate redesign (config.yaml-only; no HERMES_* env var). "prompt" (default) is
+    # today's behavior, byte-identical: the agent's final free text is delivered unless it
+    # matches a silence marker. "tool" inverts the contract for free-response groups — the
+    # free-text tail is NOT auto-delivered; delivery happens only when the model calls
+    # send_message(target="current"). DMs and mention-gated groups are unaffected in either mode.
+    reply_gate_mode: str = "prompt"
+    # DEPRECATED, no-op as of the explicit-decision redesign: the fallback ratchet that used to
+    # auto-deliver a substantive-looking free-text tail when the model made zero current-chat tool
+    # calls has been removed. The model must now EXPLICITLY call send_message(target="current").
+    reply_gate_tool_fallback: bool = True
     stt_enabled: bool = True  # Auto-transcribe inbound voice messages
     stt_echo_transcripts: bool = True  # Echo raw STT transcripts back to the user
     group_sessions_per_user: bool = True  # Isolate group sessions per participant when user IDs exist
@@ -637,6 +649,7 @@ class GatewayConfig:
         "room_link_url", "systemd_watchdog_seconds", "loop_watchdog",
         "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s",
         "loop_watchdog_max_strikes", "unauthorized_dm_behavior", "unauthorized_dm_decline_message",
+        "reply_gate_mode", "reply_gate_tool_fallback",
     )
 
     def __post_init__(self) -> None:
@@ -775,6 +788,10 @@ class GatewayConfig:
             quick_commands=_coerce_dict(data.get("quick_commands", {})),
             sessions_dir=Path(data["sessions_dir"]) if "sessions_dir" in data else get_hermes_home() / "sessions",
             **{name: _coerce_bool(data.get(name), default) for name, default in _TOPLEVEL_BOOL_DEFAULTS.items()},
+            # reply_gate_mode: top-level key wins, else the nested ``gateway:`` section (``pick``),
+            # so a config.yaml written via `hermes config set gateway.reply_gate_mode tool` is not
+            # silently resolved to the "prompt" default just because the top-level key is absent.
+            reply_gate_mode=_normalize_choice(pick("reply_gate_mode"), REPLY_GATE_MODES, "prompt"),
             stt_enabled=_coerce_bool(stt_setting("stt_enabled", "enabled"), True),
             stt_echo_transcripts=_coerce_bool(stt_setting("stt_echo_transcripts", "echo_transcripts"), True),
             multiplex_profiles=None if multiplex_profiles is None else _coerce_bool(multiplex_profiles, True),

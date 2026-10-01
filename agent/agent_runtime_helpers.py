@@ -24,7 +24,8 @@ from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_res
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
-    STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
+    STATUS_EXHAUSTED, USAGE_LIMIT_REASON_TOKENS as _USAGE_LIMIT_REASON_TOKENS,
+    _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
     credential_pool_matches_provider, resolve_runtime_pool_key,
 )
 from agent.error_classifier import FailoverReason
@@ -702,7 +703,6 @@ _STATUS_TO_FAILOVER_REASON = {
     402: FailoverReason.billing, 429: FailoverReason.rate_limit, 401: FailoverReason.auth,
     403: FailoverReason.auth,
 }
-_USAGE_LIMIT_REASON_TOKENS = ("usage_limit_reached", "gousagelimit")
 _USAGE_LIMIT_MESSAGE_TOKENS = ("usage limit reached", "usage limit has been reached")
 
 
@@ -764,6 +764,14 @@ def _is_entitlement_403(agent, status_code, error_context) -> bool:
 
 def _recover_auth_failure(agent, pool, *, status_code, has_retried_429, error_context, api_key_hint, credential_id, rotate_and_swap):
     if _is_entitlement_403(agent, status_code, error_context):
+        # An account-scoped entitlement 403 (e.g. Anthropic "OAuth authentication is currently
+        # not allowed for this organization", or an xAI SuperGrok entitlement body) is not
+        # fixable by refreshing the SAME account's token — but another pooled account may still
+        # be entitled. Try to rotate to a healthy sibling before abandoning the provider. Only
+        # when rotation yields nothing (sole/unentitled pool) do we fall through to surface the
+        # real terminal error instead of spinning the refresh loop.
+        if rotate_and_swap(403, "entitlement-shaped 403"):
+            return True, False
         _ra().logger.info(
             "Credential %s — entitlement-shaped 403 from %s; "
             "skipping pool refresh (account lacks subscription, "
@@ -1218,6 +1226,31 @@ def _revert_credential_rotation(agent) -> None:
     agent._credential_pool_revert_id = None
 
 
+def _live_state_diverges_from_primary(agent) -> bool:
+    """True when the live agent runtime no longer matches the primary snapshot on any field that
+    determines which endpoint/credential a request uses. Absent a snapshot there is nothing to
+    compare against (conservative False). Compares provider, api_mode and base_url; for native
+    Anthropic (anthropic_messages) it also checks the OAuth flag and that a captured primary API
+    key has not been lost live ('Bearer None'). Intentionally does NOT look at prompt/history or
+    model slug — self-heal restores runtime plumbing only, never cached conversation state."""
+    rt = getattr(agent, "_primary_runtime", None)
+    if not rt:
+        return False
+    if (getattr(agent, "provider", None) or "") != (rt.get("provider") or ""):
+        return True
+    if (getattr(agent, "api_mode", None) or "") != (rt.get("api_mode") or ""):
+        return True
+    if str(getattr(agent, "base_url", "") or "").rstrip("/") != str(rt.get("base_url") or "").rstrip("/"):
+        return True
+    if rt.get("api_mode") == "anthropic_messages":
+        if bool(getattr(agent, "_is_anthropic_oauth", False)) != bool(rt.get("is_anthropic_oauth", False)):
+            return True
+        live_key = getattr(agent, "_anthropic_api_key", None)
+        if rt.get("anthropic_api_key") and not live_key:
+            return True
+    return False
+
+
 def restore_primary_runtime(agent) -> bool:
     """Restore the primary runtime at the start of a new turn so fallback stays turn-scoped
     (long-lived CLI agents and the gateway's cached agents)."""
@@ -1226,13 +1259,25 @@ def restore_primary_runtime(agent) -> bool:
         # _fallback_index past the chain end and silently block future fallbacks.
         agent._fallback_index = 0
         _revert_credential_rotation(agent)
-        return False
+        # Self-heal a DEGRADED session. A fallback that never flipped the flag (chain exhausted /
+        # provider unconfigured / no credentials) or a mid-turn credential rebuild can still have
+        # mutated the live provider/api_mode/base_url/anthropic state off the primary snapshot.
+        # Because the gateway caches agents across turns, that drift otherwise persists for the
+        # rest of the session (wrong host, 'Bearer None'). If the live state diverges, fall through
+        # to the normal restore below; otherwise this is a genuine no-op and we must NOT announce a
+        # phantom recovery (which would oscillate every turn on an already-healthy session).
+        if not _live_state_diverges_from_primary(agent):
+            return False
+        logger.warning(
+            "restore_primary_runtime: live runtime diverged from primary without the fallback "
+            "flag set — self-healing degraded session back to the primary runtime."
+        )
     # Reset the chain index even when no fallback was activated this turn. Without this, a turn where
     # _try_activate_fallback() was called but returned False (chain exhausted or provider not configured)
     # leaves _fallback_index >= len(_fallback_chain) while _fallback_activated stays False. The next turn
     # skips this block entirely, stranding the index and silently blocking all future fallback attempts for
     # the session. Fixes #20465.
-    if getattr(agent, "_rate_limited_until", 0) > time.monotonic():
+    elif getattr(agent, "_rate_limited_until", 0) > time.monotonic():
         return False  # primary still in rate-limit cooldown, stay on fallback
     rt = agent._primary_runtime
     primary_provider = str((rt or {}).get("provider") or "").strip().lower()
@@ -2425,7 +2470,13 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
                 tool_call_id=tool_call_id, session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+                # ``set()`` is explicit deny-all authority; only ``None`` means
+                # the legacy unrestricted/default-tool path.
+                enabled_tools=(
+                    list(agent.valid_tool_names)
+                    if agent.valid_tool_names is not None
+                    else None
+                ),
                 skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
@@ -3033,7 +3084,13 @@ def looks_like_codex_intermediate_ack(
     """Detect a planning/ack message that should continue instead of ending the turn.
     ``require_workspace=False`` (opt-in for all api_modes) drops the filesystem/repo reference
     requirement; future-ack + short-content + no-prior-tools + action-verb checks always apply."""
-    if any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages):
+    # Only a tool result WITHIN THIS turn means real work already started; a completed earlier
+    # turn's tool row must not suppress continuation-ack detection for a fresh request.
+    from agent.turn_context import reanchor_current_turn_user_idx
+    turn_start = reanchor_current_turn_user_idx(messages, user_message) + 1
+    if any(
+        isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages[turn_start:]
+    ):
         return False
     assistant_text = agent._strip_think_blocks(assistant_content or "").strip().lower()
     if not assistant_text or len(assistant_text) > 1200:
@@ -3119,6 +3176,46 @@ _TRAILING_CONTINUE_INTENT_RE = re.compile(
 
 # Content longer than this is a substantive reply, not a dangling ack.
 _TRAILING_CONTINUE_INTENT_MAX_CHARS = 400
+
+
+def build_unfinished_todo_nudge(baseline: dict, current: dict) -> Optional[str]:
+    """Reconcile only unfinished items authored/changed since turn hydration.
+
+    This is an ADVISORY, not an execution gate: the model must decide whether the work is
+    still wanted and authorized. No phrase classifier can decide that reliably from a final
+    answer or a mid-turn side request, so the nudge enumerates the constraints (stop, pause,
+    cancel, supersession, missing authorization, background handoffs, planning-only) and
+    leaves the judgement to the model.
+
+    Diffing against the turn's baseline is what keeps it honest: an old paused plan restored
+    from history is prior state, so only items this turn created or changed can re-prompt.
+    """
+    if current["revision"] <= baseline["revision"]:
+        return None
+    before = {item["id"]: item for item in baseline["todos"]}
+    unfinished = [
+        item for item in current["todos"]
+        if item["status"] in {"pending", "in_progress"}
+        and item != before.get(item["id"])
+    ]
+    if not unfinished:
+        return None
+    # The store has its own bounds; keep this one-shot reminder small too.
+    shown = json.dumps(unfinished[:8], ensure_ascii=False)[:4000]
+    return (
+        "[System: Unfinished task reconciliation. Your todo plan created or "
+        "changed during this turn still contains unfinished items (excerpt):\n"
+        f"{shown}\n"
+        "Before ending, reconcile these with the user's latest instructions. "
+        "A todo is not authorization. Respect any user stop, pause, cancel, or "
+        "superseding request; missing authorization or other blockers; pending "
+        "background handoffs; and planning-only requests. In those cases, end "
+        "with an honest status or the necessary question, without resuming the "
+        "work. Otherwise, continue the still-requested, authorized work using "
+        "the available tools. Do not mark anything complete without evidence "
+        "or claim the task is complete merely to clear this reminder. This "
+        "is a one-time check, not a requirement to execute or finish every todo.]"
+    )
 
 
 def trailing_continue_intent(text: str) -> bool:

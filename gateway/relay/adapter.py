@@ -2282,6 +2282,21 @@ class RelayAdapter(BasePlatformAdapter):
                 return self._ACK_EMOJI_BY_PLATFORM.get(name, self._ACK_EMOJI_DEFAULT)
         return self._ACK_EMOJI_DEFAULT
 
+    @property
+    def supports_reactions(self) -> bool:  # type: ignore[override]
+        try:
+            return bool(self.descriptor.supports_op("react"))
+        except Exception:  # noqa: BLE001 - probe never breaks the caller
+            return False
+
+    async def react(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Public react entry point; routes through the target ledger (_react)."""
+        return bool(emoji) and await self._react(str(chat_id), str(message_id), emoji)
+
+    async def unreact(self, chat_id: str, message_id: str, emoji: str = "") -> bool:
+        """Public unreact entry point; the ledger op carries ``remove=True``."""
+        return await self._react(str(chat_id), str(message_id), emoji or "", remove=True)
+
     async def _react(
         self,
         chat_id: str,
@@ -2308,9 +2323,10 @@ class RelayAdapter(BasePlatformAdapter):
         return result is not None
 
     async def on_processing_start(self, event) -> None:
-        """Add the in-progress reaction (op-gated; silent no-op otherwise)."""
+        """Add the in-progress reaction (op-gated; silent no-op otherwise).
+        Never on a suppressed turn (mode off / reply-gated silence)."""
         message_id, chat_id = _event_ids(event)
-        if message_id and chat_id:
+        if message_id and chat_id and not self._processing_reaction_suppressed(event):
             eyes, _ok, _fail = self._ack_emoji(event, chat_id)
             await self._react(str(chat_id), str(message_id), eyes)
 
@@ -2318,7 +2334,7 @@ class RelayAdapter(BasePlatformAdapter):
         """Swap the in-progress reaction for the outcome one (op-gated; silent
         no-op otherwise)."""
         message_id, chat_id = _event_ids(event)
-        if not (message_id and chat_id):
+        if not (message_id and chat_id) or self._processing_reaction_suppressed(event):
             return
         eyes, ok_emoji, fail_emoji = self._ack_emoji(event, chat_id)
         await self._react(str(chat_id), str(message_id), eyes, remove=True)

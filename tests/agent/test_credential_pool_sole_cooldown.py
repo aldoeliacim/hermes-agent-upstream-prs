@@ -141,7 +141,18 @@ def test_multi_key_429_keeps_full_bench(tmp_path, monkeypatch):
         ],
     )
     assert pool.has_available() is False
-    assert pool.select() is None
+    # ``has_available()`` is the rotation signal and correctly reports False:
+    # neither key is eligible for normal selection. ``select()`` is the
+    # last-resort path and deliberately returns a benched key WITH ITS REAL
+    # TOKEN instead of None for a TRANSIENT failure -- None makes the caller
+    # build a keyless client, and a `Bearer None` request draws a misleading
+    # provider error that re-benches the key in a death-loop (2026-06-16
+    # desktop outage). A 429 recovers, so retrying it honestly beats sending
+    # no credential. TERMINAL billing/402 failures are excluded from last-resort
+    # and DO reach None -- asserted by the billing tests above.
+    entry = pool.select()
+    assert entry is not None
+    assert entry.runtime_api_key, "last resort must carry a real token, never keyless"
 
 
 # ── #82154: UNVERIFIED billing must not keep the one-hour bench ──────────────

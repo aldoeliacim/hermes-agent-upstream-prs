@@ -423,6 +423,7 @@ from gateway.platforms.base_exec_approval import (
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from gateway.warning_notifications import diagnostic_wake_muted
 from gateway.session import SessionSource, build_session_key
+from gateway.reply_policy import ReplyPolicy, resolve_reply_policy
 from gateway.session_transcript import TranscriptReadError
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -1238,6 +1239,36 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
 # Bare extensions (no dot) longest-first so a shorter ext never matches as a prefix of a longer one.
 _MEDIA_EXT_ALTERNATION = "|".join(sorted((e.lstrip(".") for e in MEDIA_DELIVERY_EXTS), key=len, reverse=True))
 
+# Delivery-tag markers — SINGLE SOURCE OF TRUTH for the tag spellings. ``MEDIA:`` and ``FILE:`` are
+# both documented to the model; on the Anthropic OAuth lane the system-prompt sanitizer rewrites every
+# ``MEDIA:`` to ``FILE:``, so on that lane ``FILE:`` is the ONLY spelling the model is ever shown.
+# The failure is asymmetric and silent in the worst direction: the extractors (built from the marker
+# alternation below) match both, so a ``FILE:`` tag DELIVERS the attachment — but a display-strip guard
+# written as a bare ``"MEDIA:" not in text`` substring test returns early and leaves the raw
+# ``FILE:/home/...`` string sitting in the user's chat next to the correctly delivered file. Every marker
+# test in the Python gateway MUST go through ``has_media_marker`` or a regex built from
+# ``_MEDIA_MARKER_ALTERNATION``. Never write a bare ``"MEDIA:" in text``: it is correct only until someone
+# reads the prompt the OAuth sanitizer actually produces. ``tests/gateway/test_media_marker_parity.py``
+# makes the class impossible: a behavioural parity suite over both spellings + a source scan that fails
+# on a new bare literal.
+MEDIA_TAG_MARKERS: Tuple[str, ...] = ("MEDIA", "FILE")
+_MEDIA_MARKER_ALTERNATION = "|".join(MEDIA_TAG_MARKERS)
+# Same markers as a boundary alternation (``MEDIA:|FILE:``) for use inside the trailing lookaheads, so a
+# tag glued to the next tag stops cleanly (#68773) regardless of which spelling the next tag uses.
+_MEDIA_MARKER_BOUNDARY = "|".join(m + ":" for m in MEDIA_TAG_MARKERS)
+_MEDIA_MARKER_PRESENT_RE = re.compile(r"(?:" + _MEDIA_MARKER_ALTERNATION + r"):", re.IGNORECASE)
+
+
+def has_media_marker(text: str) -> bool:
+    """True when ``text`` contains any delivery-tag marker (``MEDIA:``/``FILE:``).
+
+    Cheap pre-filter for the "is there anything to do here?" guards that used to hard-code
+    ``"MEDIA:" not in text``. Deliberately marker-only (it does NOT validate the path) so it stays a
+    strict superset of what the anchored extractors can match: a guard may never return early on text
+    an extractor would have acted on.
+    """
+    return bool(text) and _MEDIA_MARKER_PRESENT_RE.search(text) is not None
+
 # Anchored ``MEDIA:<path>`` cleanup pattern (dispatch path + streaming consumer). Strips only tags
 # whose path ends in a deliverable extension (optionally quoted/backticked); unknown-ext tags stay
 # for the bare-path detector. Rules: anchors ``~/``, ``/``, ``X:\`` / ``X:/``; up to 3 quote/
@@ -1264,10 +1295,10 @@ _MEDIA_EXT_ALTERNATION = "|".join(sorted((e.lstrip(".") for e in MEDIA_DELIVERY_
 _MEDIA_CJK_TERMINATORS = "（）〈〉《》：，。；！？、\u201c\u201d\u2018\u2019【】"
 
 MEDIA_TAG_CLEANUP_RE = re.compile(
-    r'''[`"'*_]{0,3}MEDIA:\s*'''
+    r'''[`"'*_]{0,3}(?:''' + _MEDIA_MARKER_ALTERNATION + r'''):\s*'''
     r'''(?P<path>`[^`\n]+?`|"[^"\n]+?"|'[^'\n]+?'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])\S+?(?:[^\S\n]+\S+?)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
-    r'''(?=[\s`"'*_,;:)\]}\[''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
+    r'''(?=[\s`"'*_,;:)\]}\[''' + _MEDIA_CJK_TERMINATORS + r''']|(?:''' + _MEDIA_MARKER_BOUNDARY + r''')|\.(?:\s|$)|$)[`"'*_]{0,3}\.?''',
     re.IGNORECASE)
 
 # Extension-less (Caddyfile) / unknown-ext (.py, .log) tags deliver only after
@@ -1292,10 +1323,10 @@ MEDIA_TAG_CLEANUP_RE = re.compile(
 # progressively extended forward across single spaces — bounded, stopping at newline / the next ``MEDIA:``
 # keyword — and the first extension that validates on disk wins.
 MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
-    r'''[`"'*_]{0,3}MEDIA:\s*'''
+    r'''[`"'*_]{0,3}(?:''' + _MEDIA_MARKER_ALTERNATION + r'''):\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
     r'''(?:~/|/|[A-Za-z]:[/\\])[^\s\n`"']+?)'''
-    r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|MEDIA:|$)'''
+    r'''(?=[`"'\s,;:)\]}''' + _MEDIA_CJK_TERMINATORS + r''']|(?:''' + _MEDIA_MARKER_BOUNDARY + r''')|$)'''
     r'''[`"'*_]{0,3}\s*''',
     re.IGNORECASE)
 
@@ -1319,9 +1350,12 @@ def _match_extensionless_path(scan_text: str, match: "re.Match") -> Optional[Tup
         return safe, match.end("path")
     start = match.start("path")
     segment = scan_text[start:].split("\n", 1)[0]
-    nxt = segment.find("MEDIA:", 1)
-    if nxt != -1:
-        segment = segment[:nxt]
+    # Stop the forward scan at the next delivery-tag marker in EITHER spelling — bounding on the literal
+    # ``"MEDIA:"`` alone let a following ``FILE:`` tag be absorbed into this path as a filename token,
+    # invalidating the candidate and dropping BOTH files (#68773 reached through the FILE: alias).
+    nxt_match = _MEDIA_MARKER_PRESENT_RE.search(segment, 1)
+    if nxt_match is not None:
+        segment = segment[:nxt_match.start()]
     pos = match.end("path") - start
     for _ in range(8):
         token = re.match(r"[ \t]*[^ \t]+", segment[pos:])
@@ -1355,7 +1389,7 @@ def _path_lacks_deliverable_extension(path: str) -> bool:
 
 
 def _has_media_directives(text: str) -> bool:
-    return "MEDIA:" in text or "[[audio_as_voice]]" in text or "[[as_document]]" in text
+    return has_media_marker(text) or "[[audio_as_voice]]" in text or "[[as_document]]" in text
 
 
 # A provider can leak its exact end-of-sequence control token glued to the last MEDIA path
@@ -1810,8 +1844,24 @@ def resolve_channel_skills(
     config_extra: dict, channel_id: str, parent_id: str | None = None) -> list[str] | None:
     """Auto-loaded skill(s) for a channel/thread from ``channel_skill_bindings`` (entries
     ``{id: "<channel/forum id>", skills: [...]}``; ``skill: "<name>"`` also accepted). Exact
-    *channel_id* first, then *parent_id* (threads inherit). Deduplicated ordered list or None."""
+    *channel_id* first, then *parent_id* (threads inherit). Deduplicated ordered list or None.
+    A binding stored as a JSON string (``hermes config set`` writes complex values verbatim)
+    is parsed rather than ignored."""
     bindings = config_extra.get("channel_skill_bindings") or []
+    if isinstance(bindings, str):
+        # `hermes config set` stores complex values verbatim as a string, so a binding added
+        # through the CLI arrives as JSON text rather than a parsed list. Silently returning None
+        # there is a false green: the CLI reports success, the config file looks correct, and the
+        # skill never loads (how the whatsapp-group-participation reply gate went unloaded).
+        try:
+            import json as _json
+            bindings = _json.loads(bindings)
+        except (ValueError, TypeError):
+            logger.warning(
+                "channel_skill_bindings is a string that is not valid JSON; "
+                "expected a list of {id, skills} entries"
+            )
+            return None
     if not isinstance(bindings, list) or not bindings:
         return None
     ids_to_check = {str(key) for key in (channel_id, parent_id) if key}
@@ -2507,6 +2557,31 @@ class BasePlatformAdapter(ABC):
             return
         key = self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
+        if existing is not None:
+            from gateway.platforms.helpers import batch_authors_match
+            if not batch_authors_match(existing, event):
+                # Batching keys on the SESSION, and a shared group session scopes
+                # one session to the whole group — so a DIFFERENT person writing
+                # inside the debounce window lands on the same key. Merging would
+                # rewrite authorship (the 2026-08-20 cross-author merge incident:
+                # the combined turn kept the first sender's name and the agent
+                # then addressed A about B's statement). Flush the pending batch
+                # as its own turn instead, then start fresh for the new author.
+                prior_task = self._pending_text_batch_tasks.get(key)
+                if prior_task and not prior_task.done():
+                    prior_task.cancel()
+                # Pop SYNCHRONOUSLY and dispatch that exact event: a key-based
+                # flush would run as a task *after* the slot was overwritten by
+                # the new author, losing the first author's batch entirely.
+                flushed = self._pending_text_batches.pop(key, None)
+                if flushed is not None:
+                    # Held in _background_tasks: an unreferenced task can be garbage-collected
+                    # mid-flight, which would silently drop the first author's message, and
+                    # cancel_background_tasks() must see it on shutdown.
+                    flush_task = asyncio.create_task(self._dispatch_text_batch(flushed))
+                    self._background_tasks.add(flush_task)
+                    flush_task.add_done_callback(self._background_tasks.discard)
+                existing = None
         if existing is None:
             existing = self._pending_text_batches[key] = event
         else:
@@ -3189,19 +3264,20 @@ class BasePlatformAdapter(ABC):
     @staticmethod
     def _mask_protected_spans(content: str) -> str:
         """Blank fenced code, inline code and blockquotes (length-preserving so regex offsets stay
-        valid) against MEDIA: false positives; backtick-quoted paths inside MEDIA: tags stay
+        valid) against MEDIA:/FILE: false positives; backtick-quoted paths inside a delivery tag stay
         scannable."""
         spans: list = [m.span() for m in _FENCED_CODE_RE.finditer(content)]
         for m in _INLINE_CODE_RE.finditer(content):
             start = m.start()
-            if re.search(r'MEDIA:\s*$', content[max(0, start - 20):start]):
-                continue  # This is a MEDIA path quote, not inline code
-            # A whole tag in inline code (`MEDIA:/path.csv`) is a real directive (models format
-            # paths as code): deliver IF it validates; non-existent examples stay masked.
-            # See #35695.
+            if re.search(r'(?:' + _MEDIA_MARKER_ALTERNATION + r'):\s*$', content[max(0, start - 20):start], re.IGNORECASE):
+                continue  # This is a delivery-tag path quote, not inline code
+            # A whole tag in inline code (`MEDIA:/path.csv`, `FILE:/path.csv`) is a real directive
+            # (models format paths as code): deliver IF it validates; non-existent examples stay
+            # masked. See #35695.
             inner = m.group(0)[1:-1].strip()
-            if inner.upper().startswith("MEDIA:"):
-                candidate = _normalize_media_tag_path(inner[6:])
+            tag = _MEDIA_MARKER_PRESENT_RE.match(inner)
+            if tag is not None:
+                candidate = _normalize_media_tag_path(inner[tag.end():])
                 if candidate and validate_media_delivery_path(candidate):
                     continue  # Real deliverable tag in inline code — keep it scannable
             spans.append((start, m.end()))
@@ -3220,13 +3296,13 @@ class BasePlatformAdapter(ABC):
         ``MEDIA_TAG_CLEANUP_RE`` would still match it and re-deliver a stale file. (Regression report
         #34375.)
         """
-        if '"' not in content or "MEDIA:" not in content:
+        if '"' not in content or not has_media_marker(content):
             return content
         # Value-context string: quote preceded by : , { or [; escape-aware body to the closing
         # quote.
         spans = [
             m.span(1) for m in re.finditer(r'(?<=[:,{\[])\s*"((?:[^"\\\n]|\\.)*)"', content)
-            if re.search(r'MEDIA:\s*(?:~/|/|[A-Za-z]:[/\\])', m.group(1))]
+            if re.search(r'(?:' + _MEDIA_MARKER_ALTERNATION + r'):\s*(?:~/|/|[A-Za-z]:[/\\])', m.group(1), re.IGNORECASE)]
         return _blank_spans(content, spans)
 
     @staticmethod
@@ -3272,12 +3348,31 @@ class BasePlatformAdapter(ABC):
 
     @staticmethod
     def strip_media_directives_for_display(text: str) -> str:
-        """Strip MEDIA: directives from streamed/display text. Known-extension tags are
+        """Strip MEDIA:/FILE: directives from streamed/display text. Known-extension tags are
         removed unconditionally (as ``MEDIA_TAG_CLEANUP_RE``); extension-less tags only when
         ``validate_media_delivery_path`` accepts the path, so undeliverable paths stay visible."""
         if not _has_media_directives(text):
             return text
         return re.sub(r'\n{3,}', '\n\n', _strip_media_tag_directives(text)).rstrip()
+
+    @classmethod
+    def has_delivery_directive(cls, content: str) -> bool:
+        """True when ``content`` will actually deliver at least one attachment.
+
+        The oracle for the auto-append guard: suppress the "did the model forget to attach?" fallback
+        iff something is genuinely going out. Unlike ``has_media_marker`` (a cheap marker-presence
+        superset that also fires on a bare ``file://`` URL or a non-existent path), this runs the real
+        extractor, so validation, masking of stored/example tags, and path-existence all apply. Use
+        this whenever the question is "will this deliver?"; use ``has_media_marker`` only for "is a tag
+        even mentioned?".
+        """
+        if not content:
+            return False
+        media, _cleaned = cls.extract_media(content)
+        if media:
+            return True
+        files, _cleaned2 = cls.extract_local_files(content)
+        return bool(files)
 
     @staticmethod
     def extract_local_files(content: str) -> Tuple[List[str], str]:
@@ -3435,6 +3530,49 @@ class BasePlatformAdapter(ABC):
         self._post_delivery_callbacks.pop(session_key, None)
         return callback if callable(callback) else None
 
+    # ── Message reactions: one declared contract ────────────────────────────
+    # ``supports_reactions`` is a CAPABILITY FLAG, not a probe: an adapter that can
+    # react says so, and callers gate on the flag instead of guessing from the
+    # presence of a method. The react model tool's check_fn hides the tool on
+    # surfaces that cannot react, so it costs zero schema tokens there — and a
+    # caller never falls back to a platform-specific primitive it cannot know.
+    supports_reactions: bool = False
+
+    async def react(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        """Attach ``emoji`` to ``message_id`` in ``chat_id``. True on success.
+
+        The default delegates to the adapter's public ``add_reaction`` when it has
+        one (the ``(chat_id, emoji, message_id)`` shape). Adapters with a different
+        native shape override this; with no primitive at all it is a safe no-op
+        returning False, never an exception.
+        """
+        fn = getattr(self, "add_reaction", None)
+        if not callable(fn):
+            return False
+        try:
+            result = await fn(chat_id, emoji, message_id)
+        except Exception as e:
+            logger.debug("[%s] react failed (%s): %s", self.name, emoji, e)
+            return False
+        # Some platforms return a dict; everything else a bool. Truthy = success.
+        return bool(result)
+
+    async def unreact(self, chat_id: str, message_id: str, emoji: str = "") -> bool:
+        """Retract this adapter's own reaction from ``message_id``.
+
+        ``emoji`` is advisory: platforms that stack reactions need it to know which
+        one to pull; platforms with one-per-sender ignore it.
+        """
+        fn = getattr(self, "remove_reaction", None)
+        if not callable(fn):
+            return False
+        try:
+            result = await fn(chat_id, message_id)
+        except Exception as e:
+            logger.debug("[%s] unreact failed: %s", self.name, e)
+            return False
+        return bool(result)
+
     # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
     # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
     # can just set the emoji attributes; left ``None`` the hook is a no-op.
@@ -3442,14 +3580,137 @@ class BasePlatformAdapter(ABC):
     _OK_EMOJI: Optional[str] = None
     _FAIL_EMOJI: Optional[str] = None
 
+    # Per-chat anti-repeat memory for smart processing reactions. Lazily created (see
+    # ``_processing_reaction_memory``) so adapters that never react pay nothing. Bounded LRU.
+    _smart_reaction_memory: Any = None
+    # ``(config signature, resolved mode)`` memo for ``_processing_reaction_mode``.
+    _processing_reaction_mode_cache: Any = None
+
+    def _processing_reaction_memory(self):
+        """Lazily-built per-chat ``ChatReactionMemory`` used by the smart picker (bounded LRU)."""
+        mem = self._smart_reaction_memory
+        if mem is None:
+            from gateway.processing_reaction import ChatReactionMemory
+            mem = self._smart_reaction_memory = ChatReactionMemory()
+        return mem
+
+    def _processing_reaction_mode(self) -> str:
+        """Resolve ``display.processing_reaction`` → one of ``static`` | ``smart`` | ``off``.
+
+        Uses the established per-platform display resolver (``resolve_display_setting`` over the
+        effective ``config.yaml``, honouring ``display.platforms.<platform>.processing_reaction``
+        then ``display.processing_reaction``), exactly as gateway streaming/tool-progress do.
+        Default is ``static`` (the fixed 👀 upstream has always sent) so this change is inert for
+        existing deployments; ``smart`` is opt-in. An unknown value degrades to ``static``.
+
+        Called up to three times per turn from the reaction hooks, so the resolved mode is
+        memoised on the config file's own cache signature (user + managed file stat): an edit to
+        config.yaml takes effect on the next turn, and an unchanged file costs one ``stat``
+        instead of a full effective-config load and deep copy.
+        """
+        from gateway.run import _gateway_config_home
+        from hermes_cli.config import _load_config_cache_sig
+        config_path = _gateway_config_home() / "config.yaml"
+        try:
+            sig = (str(config_path), _load_config_cache_sig(config_path)[1])
+        except Exception:
+            sig = None
+        cached = self._processing_reaction_mode_cache
+        if sig is not None and cached is not None and cached[0] == sig:
+            return cached[1]
+        try:
+            from gateway.run import _load_gateway_config, _platform_config_key
+            from gateway.display_config import resolve_display_setting
+            raw = resolve_display_setting(
+                _load_gateway_config(config_path), _platform_config_key(self.platform),
+                "processing_reaction", "static",
+            )
+        except Exception:
+            raw = "static"
+        mode = str(raw).strip().lower() if raw is not None else "static"
+        mode = mode if mode in ("static", "smart", "off") else "static"
+        if sig is not None:
+            self._processing_reaction_mode_cache = (sig, mode)
+        return mode
+
+    def _processing_reaction_silence_gated(self, event: MessageEvent) -> bool:
+        """True when this turn may end in a deliberate silence, so it must carry NO reaction.
+
+        A reply-gated free-response group turn (``reply_gate_mode == "tool"`` and
+        ``source.reply_policy == FREE_RESPONSE``) lets the agent decide to stay silent. Any
+        reaction there, start or outcome, tells the room the bot read and acted, which breaks
+        that decision. The single source of truth is the runner's ``_is_reply_tool_gated``;
+        the adapter reaches it through ``gateway_runner``, which ``run_adapters`` sets on every
+        registered adapter. With no runner (CLI, tests) there is no reply gate, so nothing is
+        gated. A predicate that raises fails CLOSED: a missed reaction is cosmetic, a leaked
+        one breaks a silence the owner relies on.
+        """
+        predicate = getattr(self.gateway_runner, "_is_reply_tool_gated", None)
+        if not callable(predicate):
+            return False
+        try:
+            return bool(predicate(getattr(event, "source", None)))
+        except Exception:
+            logger.warning("[%s] reply-gate predicate failed; suppressing processing reaction",
+                           self.name, exc_info=True)
+            return True
+
+    def _processing_reaction_suppressed(self, event: MessageEvent) -> bool:
+        """True when this turn gets no processing reaction at all: mode ``off`` or a
+        reply-gated silence-likely turn. Every processing-hook reaction call checks this
+        (``tests/gateway/test_processing_reaction_silence.py`` enforces it structurally)."""
+        return self._processing_reaction_mode() == "off" or self._processing_reaction_silence_gated(event)
+
+    def _processing_ack_emoji(self, event: MessageEvent) -> Optional[str]:
+        """Choose the *start* reaction emoji for this turn, or ``None`` to send no reaction.
+
+        ``None`` when suppressed (mode ``off`` or a reply-gated silence-likely turn).
+        ``static`` → the fixed :data:`STATIC_ACK_EMOJI` (👀), preserving upstream behaviour.
+        ``smart`` → a contextual, anti-repeat pick from :mod:`gateway.processing_reaction`.
+        """
+        if self._processing_reaction_suppressed(event):
+            return None
+        if self._processing_reaction_mode() != "smart":
+            from gateway.processing_reaction import STATIC_ACK_EMOJI
+            return STATIC_ACK_EMOJI
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        return self._processing_reaction_memory().pick(
+            chat_id, getattr(event, "text", None), getattr(event, "message_type", None))
+
+    def _processing_outcome_emoji(self, event: MessageEvent, success: bool) -> str:
+        """Choose the *outcome* reaction that replaces the start emoji.
+
+        ``static`` keeps the fixed 👍/👎. ``smart`` varies the success emoji (anti-repeat) while
+        failure stays an unambiguous 👎. Callers keep their own CANCELLED handling.
+        """
+        if self._processing_reaction_mode() != "smart":
+            from gateway.processing_reaction import STATIC_OK_EMOJI, STATIC_FAIL_EMOJI
+            return STATIC_OK_EMOJI if success else STATIC_FAIL_EMOJI
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        return self._processing_reaction_memory().pick_outcome(chat_id, success)
+
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Hook called when background processing begins."""
+        """Hook called when background processing begins. Default: opt-in reaction ack — with
+        ``_ACK_EMOJI`` set and ``_add_reaction`` present, set the start reaction chosen by
+        ``_processing_ack_emoji`` (nothing on a suppressed turn)."""
+        if self._ACK_EMOJI is None:
+            return
+        add: Any = getattr(self, "_add_reaction", None)
+        enabled = getattr(self, "_reactions_enabled", None)
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not callable(add) or (callable(enabled) and not enabled()) or not chat_id or not message_id:
+            return
+        emoji = self._processing_ack_emoji(event)
+        if emoji:
+            await add(chat_id, message_id, emoji)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes. Default: opt-in reaction ack — with
         ``_OK_EMOJI``/``_FAIL_EMOJI`` set and ``_add_reaction``/``_remove_reaction`` present, swap
         the in-progress reaction for the outcome one. Remove-then-add is deterministic whether the
-        platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted."""
+        platform replaces or stacks a sender's reactions. CANCELLED leaves it unreacted, and a
+        suppressed turn (mode off / reply-gated silence) is never touched."""
         if self._OK_EMOJI is None and self._FAIL_EMOJI is None:
             return
         add: Any = getattr(self, "_add_reaction", None)
@@ -3458,11 +3719,15 @@ class BasePlatformAdapter(ABC):
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
         if (not callable(add) or not callable(remove) or (callable(enabled) and not enabled())
-                or not chat_id or not message_id):
+                or not chat_id or not message_id or self._processing_reaction_suppressed(event)):
             return
         await remove(chat_id, message_id)
-        emoji = {ProcessingOutcome.SUCCESS: self._OK_EMOJI,
-                 ProcessingOutcome.FAILURE: self._FAIL_EMOJI}.get(outcome)
+        if outcome == ProcessingOutcome.SUCCESS:
+            emoji: Optional[str] = self._processing_outcome_emoji(event, True) if self._OK_EMOJI else None
+        elif outcome == ProcessingOutcome.FAILURE:
+            emoji = self._processing_outcome_emoji(event, False) if self._FAIL_EMOJI else None
+        else:
+            emoji = None
         if emoji:
             await add(chat_id, message_id, emoji)
 
@@ -4665,12 +4930,57 @@ class BasePlatformAdapter(ABC):
                                self.platform, chat_id, exc_info=True)
         source = SessionSource(**fields, profile=profile, role_authorized=role_authorized,
                                auto_thread_created=auto_thread_created,
-                               auto_thread_initial_name=auto_thread_initial_name)
+                               auto_thread_initial_name=auto_thread_initial_name,
+                               reply_policy=self._reply_policy_for(chat_type, str(chat_id)))
         # Transport-only, kept out of to_dict(): the receiving adapter is authoritative this turn
         # even if profile_routes picks another runtime; the reject flag is consumed before auth.
         source._transport_adapter_ref = weakref.ref(self)
         source.profile_route_rejected = profile_route_rejected
         return source
+
+    # ------------------------------------------------------------------
+    # Reply-policy classification (delivery layer). Generic base helper so
+    # every adapter that builds a SessionSource stamps ``reply_policy`` from
+    # the same three signals its own ``_should_process_message`` already
+    # consults, WITHOUT each adapter re-implementing the mapping. Adapters
+    # whose mention / free-response config is exposed differently override the
+    # two small hooks below rather than the resolver.
+    # ------------------------------------------------------------------
+    def _reply_policy_for(self, chat_type: Optional[str], chat_id: str) -> ReplyPolicy:
+        """Classify this inbound turn for the post-turn delivery block.
+
+        Non-group turns (DMs, and any unknown/None chat_type) resolve to the
+        safe :attr:`ReplyPolicy.DM`, which never arms the tool-gated delivery
+        inversion — so a partially-rolled-out platform stays non-breaking.
+        Group/channel/thread turns are classified from the adapter's own
+        ``require_mention`` / free-response config via :func:`resolve_reply_policy`.
+        """
+        is_group = (chat_type or "").strip().lower() in ("group", "channel", "thread")
+        if not is_group:
+            return ReplyPolicy.DM
+        return resolve_reply_policy(
+            is_group=True,
+            in_free_response_set=self._chat_in_free_response_set(chat_id),
+            require_mention=self._adapter_require_mention(),
+        )
+
+    def _adapter_require_mention(self) -> bool:
+        """Whether this adapter only processes group messages that mention the bot.
+
+        Default reads a boolean ``require_mention`` attribute if the adapter
+        sets one (bluebubbles, signal); otherwise defaults to ``True`` (the
+        safe, mention-gated value that does NOT arm the free-response reply
+        gate). Adapters that expose this via a method (e.g. WhatsApp) override.
+        """
+        return bool(getattr(self, "require_mention", True))
+
+    def _chat_in_free_response_set(self, chat_id: str) -> bool:
+        """Whether ``chat_id`` is in this adapter's free-response allow set.
+
+        Default ``False``; adapters with a free-response chat allow-list
+        (e.g. WhatsApp ``free_response_chats``) override to consult it.
+        """
+        return False
 
     @abstractmethod
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

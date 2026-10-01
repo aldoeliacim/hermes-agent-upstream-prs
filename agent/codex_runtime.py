@@ -928,11 +928,14 @@ class _CodexResponseAssembler:
         return [entry[2] for entry in indexed]
 
     def result(self) -> SimpleNamespace:
+        # A stream that ends (EOF) without any terminal frame is truncated, never a success —
+        # ``status`` must reflect that even when partial deltas arrived.
+        status = self.terminal_status if self.saw_terminal else "incomplete"
         # With only plain text deltas (no tool calls), synthesize one message item.
         output: List[Any] = list(self.output_items)
         if not output and self.text_deltas and not self.has_tool_calls:
             content = [SimpleNamespace(type="output_text", text="".join(self.text_deltas))]
-            output = [SimpleNamespace(type="message", role="assistant", status="completed", content=content)]
+            output = [SimpleNamespace(type="message", role="assistant", status=status, content=content)]
         # Done items stay authoritative; settlement only fills the gap left by backends that omit
         # per-item done events on a successful completion.
         if self.pending_function_calls and self.saw_response_completed:
@@ -941,7 +944,7 @@ class _CodexResponseAssembler:
         if not self.saw_terminal and not output:
             raise RuntimeError("Codex Responses stream did not emit a terminal response")
         return SimpleNamespace(
-            output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=self.terminal_status,
+            output=output, output_text="".join(self.text_deltas), usage=self.terminal_usage, status=status,
             id=self.terminal_response_id, model=self.model, incomplete_details=self.terminal_incomplete_details,
             error=self.terminal_error)
 

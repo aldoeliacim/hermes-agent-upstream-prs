@@ -2365,6 +2365,15 @@ def test_load_enabled_toolsets_folds_project_into_focus_posture(monkeypatch):
     assert server._load_enabled_toolsets("tui") == ["coding", "figma", "project"]
 
 
+# Local layer: the restored native-surface tools (send_message, react, whatsapp_action[_admin])
+# are _HERMES_CORE_TOOLS members, so _recover_platform_native_toolsets() re-adds their
+# standalone entries onto an explicit saved list; each tool stays check_fn-gated and
+# inert off its surface. Closed set: anything else the fallback adds still fails.
+_LOCAL_NATIVE_RECOVERY = frozenset({
+    "messaging", "reactions", "whatsapp_action_recovery", "whatsapp_action_admin_recovery",
+})
+
+
 def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     monkeypatch.setenv("HERMES_TUI_TOOLSETS", "mcp-off")
     monkeypatch.setitem(
@@ -2395,7 +2404,7 @@ def test_load_enabled_toolsets_rejects_disabled_mcp_env(monkeypatch, capsys):
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
-    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
+    assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS | _LOCAL_NATIVE_RECOVERY
     err = capsys.readouterr().err
     assert "mcp-off" in err
 
@@ -2420,6 +2429,9 @@ def test_load_enabled_toolsets_falls_back_when_tui_env_invalid(monkeypatch, caps
     assert result is not None
     assert {"memory", "project"} <= set(result)
     assert "kanban" not in result
+    assert "using configured CLI toolsets" in capsys.readouterr().err
+
+
     assert set(result) - {"memory", "project"} <= _RECENTLY_SHIPPED_TOOLSETS
     assert capsys.readouterr().err.strip()  # a fallback warning is printed
 
@@ -16402,7 +16414,13 @@ def test_model_options_propagates_list_exception(monkeypatch):
 
 
 
-def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypatch):
+@pytest.mark.parametrize(
+    ("anthropic_oauth", "expected_slugs"),
+    [(False, ["custom:local-ollama"]), (True, ["anthropic", "custom:local-ollama"])],
+)
+def test_model_options_preserves_canonical_custom_row_after_agent_init(
+    monkeypatch, anthropic_oauth, expected_slugs,
+):
     from hermes_cli.inventory import ConfigContext
 
     class _Agent:
@@ -16452,6 +16470,8 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
         "hermes_cli.auth.is_provider_explicitly_configured",
         lambda _slug: False,
     )
+    monkeypatch.setattr("hermes_cli.inventory._anthropic_oauth_credentials_present", lambda: anthropic_oauth)
+    monkeypatch.setattr("hermes_cli.inventory._external_process_signed_in", lambda _slug: False)
     monkeypatch.setattr("hermes_cli.inventory._apply_pricing", lambda *_args, **_kwargs: None)
     monkeypatch.setattr("hermes_cli.inventory._apply_capabilities", lambda *_args, **_kwargs: None)
 
@@ -16462,6 +16482,13 @@ def test_model_options_preserves_canonical_custom_row_after_agent_init(monkeypat
 
     assert "result" in resp, resp
     assert resp["result"]["provider"] == "custom:local-ollama"
+    canonical.assert_called_once_with(
+        base_url="http://127.0.0.1:11434/v1",
+        config_provider="custom:local-ollama",
+        model="qwen3.6:35b-65k",
+    )
+
+
     assert [row["slug"] for row in resp["result"]["providers"]] == [
         "custom:local-ollama"
     ]

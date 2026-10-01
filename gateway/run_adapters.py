@@ -193,6 +193,12 @@ class GatewayAdapterLifecycleMixin:
 
     async def _handle_reaction_event(self, ctx: Dict[str, Any]) -> None:
         """Fan a normalised reaction event out to the HookRegistry; errors never block the adapter."""
+        # Legacy reaction dictionaries do not carry an authenticated complete
+        # audience, so they cannot safely enter the private hook registry once an
+        # isolation policy is loaded (worker reactions are delivered through the
+        # relay instead).
+        if getattr(self, "_isolated_policy", None) is not None:
+            return
         event_name = str(ctx.get("event_name") or "reaction:added")
         with _log_suppressed(logging.DEBUG, "[Gateway] reaction hook emit failed", exc_info=True):
             await self.hooks.emit(event_name, ctx)
@@ -1500,6 +1506,11 @@ class GatewayAdapterLifecycleMixin:
         """Message handler that canonicalizes the event's identity FIRST, then delegates under the
         profile scope (auth runs BEFORE the agent-turn scope, so the profile's ``.env`` must be
         visible here)."""
+        # Under isolation the profile fan-out is refused at startup (multiplex and
+        # isolation are mutually exclusive), so the raw handler is the only one
+        # that may run — no stamping, no scope, no private profile mutation.
+        if getattr(self, "_isolated_policy", None) is not None:
+            return self._handle_message
         from gateway.run import _async_profile_runtime_scope
         profile_home = self._routed_profile_home(profile_name)
 
@@ -1513,6 +1524,8 @@ class GatewayAdapterLifecycleMixin:
     def _make_profile_busy_session_handler(self, profile_name: str):
         """Busy-path twin: canonicalize FIRST, then resolve busy policy under the profile scope
         (auth runs against the profile's own allowlist, same as the cold-path message handler)."""
+        if getattr(self, "_isolated_policy", None) is not None:
+            return self._handle_active_session_busy_message
         from gateway.run import _async_profile_runtime_scope
         profile_home = self._routed_profile_home(profile_name)
 
@@ -1526,6 +1539,11 @@ class GatewayAdapterLifecycleMixin:
     def _make_default_profile_message_handler(self):
         """Scope primary-adapter messages to their routed multiplex profile. Authorization stays
         with the transport profile (a routed profile may have no credential/allowlist)."""
+        # Isolation needs the RAW handler: the multiplex admission below stamps a
+        # profile home onto the source, and a worker event must not carry private
+        # routing state into the gate that decides whether it is a worker event.
+        if getattr(self, "_isolated_policy", None) is not None:
+            return self._handle_message
         from gateway.run import _async_profile_runtime_scope, get_hermes_home
         default_home = Path(get_hermes_home())
 
@@ -1601,6 +1619,8 @@ class GatewayAdapterLifecycleMixin:
 
     def _make_profile_platform_event_handler(self, profile_name: str):
         """Bind platform-event auth and hook dispatch to one multiplex profile."""
+        if getattr(self, "_isolated_policy", None) is not None:
+            return self._handle_gateway_platform_event
         from gateway.run import _profile_runtime_scope
         profile_home = self._routed_profile_home(profile_name)
 

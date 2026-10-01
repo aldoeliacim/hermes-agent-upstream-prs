@@ -442,10 +442,10 @@ gateway:
 
   verbose:
     not_enabled:           "The `/verbose` command is not enabled for messaging platforms.\n\nEnable it in `config.yaml`:\n```yaml\ndisplay:\n  tool_progress_command: true\n```"
-    mode_off:              "⚙️ Tool progress: **OFF** — no tool activity shown."
-    mode_new:              "⚙️ Tool progress: **NEW** — shown when tool changes (preview length: `display.tool_preview_length`, default 40)."
-    mode_all:              "⚙️ Tool progress: **ALL** — every tool call shown (preview length: `display.tool_preview_length`, default 40)."
-    mode_verbose:          "⚙️ Tool progress: **VERBOSE** — every tool call with full arguments."
+    mode_off:              "⚙️ Tool progress: **OFF** — no tool-call log; on Slack, native task cards are also off. In-chat progress bubbles were removed, so nothing is shown in chat either way."
+    mode_new:              "⚙️ Tool progress: **NEW** — legacy value; in-chat progress bubbles were removed (#921), so this no longer shows anything in chat."
+    mode_all:              "⚙️ Tool progress: **ALL** — legacy value; in-chat progress bubbles were removed (#921), so this no longer shows anything in chat."
+    mode_verbose:          "⚙️ Tool progress: **VERBOSE** — legacy value; in-chat progress bubbles were removed (#921), so this no longer shows anything in chat."
     mode_log:              "⚙️ Tool progress: **LOG** — silent in chat; tool calls written to ~/.hermes/logs/tool_calls.log."
     saved_suffix:          "_(saved for **{platform}** — takes effect on next message)_"
     save_failed:           "_(could not save to config: {error})_"

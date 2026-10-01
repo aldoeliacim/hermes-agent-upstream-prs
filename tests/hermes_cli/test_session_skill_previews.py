@@ -125,6 +125,17 @@ class TestCompactionPreview:
 
         assert row["preview"] == "test the browser controller"
 
+    def test_every_summary_prefix_generation_is_a_preview_carrier(self):
+        """The preview filter keys on an intro sentence; every generation (current and each
+        byte-pinned historical prefix) must start with it, or a revised SUMMARY_PREFIX
+        silently stops recognising older transcripts' compaction rows."""
+        from agent.context_compressor import SUMMARY_PREFIX
+        from hermes_state_common import _PREVIEW_LONG_FORM_PREFIX
+
+        assert len(_PREVIEW_LONG_FORM_PREFIX) < len(SUMMARY_PREFIX)
+        for prefix in (SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
+            assert prefix.startswith(_PREVIEW_LONG_FORM_PREFIX), prefix[:120]
+
     def test_historical_compaction_row_cannot_become_session_preview(self, db):
         summary = (
             f"{_HISTORICAL_SUMMARY_PREFIXES[-1]}\n\n"

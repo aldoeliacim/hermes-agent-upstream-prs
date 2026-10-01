@@ -1035,6 +1035,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # None until then; accessors fall back to live scope-aware reads (issue #72348).
         self._gate_env_snapshot: Optional[Dict[str, str]] = None
         self.gateway_runner = None  # Set by gateway/run.py for cross-platform delivery
+        # id(message) -> start reaction emoji actually set, so on_processing_complete removes the
+        # exact one (Discord stacks reactions). Naturally bounded: an entry is popped on
+        # completion, so it only holds in-flight turns.
+        self._discord_ack_emoji: Dict[int, str] = {}
         self._voice_clients: Dict[int, Any] = {}  # guild_id -> VoiceClient
         self._voice_locks: Dict[int, asyncio.Lock] = {}  # guild_id -> serialize join/leave
         # Text batching: merge rapid successive messages (Telegram-style)
@@ -2908,6 +2912,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         summary["total"] = len(desired_payloads)
         return summary
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _add_reaction(self, message: Any, emoji: str) -> bool:
         """Add an emoji reaction to a Discord message."""
         if not message or not hasattr(message, "add_reaction"):
@@ -2935,21 +2942,34 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction and record durable handling state."""
+        """Add an in-progress reaction and record durable handling state.
+
+        The start emoji is chosen by the base ``_processing_ack_emoji`` (fixed 👀 in ``static``
+        mode; contextual anti-repeat in ``smart`` mode; ``None`` when off or reply-gated silence).
+        It is stashed on the event so ``on_processing_complete`` removes the exact emoji it set
+        (Discord stacks reactions, so remove needs the value). ``_reactions_enabled`` stays the
+        authoritative gate.
+        """
         message = event.raw_message
         acked = False
-        if self._reactions_enabled() and hasattr(message, "add_reaction"):
-            acked = await self._add_reaction(message, "👀")
+        emoji = self._processing_ack_emoji(event)
+        if emoji and self._reactions_enabled() and hasattr(message, "add_reaction"):
+            acked = await self._add_reaction(message, emoji)
+            if acked:
+                self._discord_ack_emoji[id(message)] = emoji
         await asyncio.to_thread(self._record_discord_processing_start, event, emoji_ack=acked)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Swap the in-progress reaction for final reaction and durable state."""
+        """Swap the in-progress reaction for final reaction and durable state. Discord's outcome
+        emojis (✅/❌) are already unambiguous and not Telegram-constrained, so only the *start*
+        emoji is smart here; we remove whichever start emoji we actually set."""
         await asyncio.to_thread(self._record_discord_processing_complete, event, outcome)
-        if not self._reactions_enabled():
+        if not self._reactions_enabled() or self._processing_reaction_suppressed(event):
             return
         message = event.raw_message
         if hasattr(message, "add_reaction"):
-            await self._remove_reaction(message, "👀")
+            start_emoji = self._discord_ack_emoji.pop(id(message), "👀")
+            await self._remove_reaction(message, start_emoji)
             if outcome == ProcessingOutcome.SUCCESS:
                 await self._add_reaction(message, "✅")
             elif outcome == ProcessingOutcome.FAILURE:

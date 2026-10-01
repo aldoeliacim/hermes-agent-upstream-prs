@@ -8,6 +8,7 @@ other's routing ids.  ``get_session_env`` is a drop-in for ``os.getenv``.
 import os
 from contextlib import contextmanager
 from contextvars import ContextVar
+from enum import Enum, auto
 from typing import Any, Iterator
 
 # "Never set here" (falls back to os.environ for CLI/cron) vs "" = explicitly cleared (no fallback).
@@ -119,7 +120,7 @@ def set_session_vars(
     message_id: str = "", profile: str = "", browser_control_principal: str = "",
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
-    session_history_delivery: str | None = None,
+    session_history_delivery: str | None = None, execution_principal: str = "",
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -140,6 +141,10 @@ def set_session_vars(
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    # Host-bound execution principal: never env-bridged, sits beside _SESSION_VARS.
+    # A worker that binds here mints its own principal; it never inherits the
+    # operator's ambient one (fail-closed on omission → "").
+    tokens.append(_EXECUTION_PRINCIPAL.set(execution_principal or ""))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -154,6 +159,10 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    # Host provenance falls back to SESSION (a bound worker, never inherited
+    # operator authority) and the principal is explicitly cleared.
+    _EXECUTION_SCOPE.set(SessionExecutionScope.SESSION)
+    _EXECUTION_PRINCIPAL.set("")
     _runtime_cwd("clear_session_cwd")
 
 
@@ -167,6 +176,9 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    # A fresh task binds its own provenance/principal; never inherit A's.
+    _EXECUTION_SCOPE.set(SessionExecutionScope.SESSION)
+    _EXECUTION_PRINCIPAL.set("")
     _runtime_cwd("clear_session_cwd")
 
 
@@ -222,3 +234,66 @@ def session_history_delivery_supported() -> bool:
 
     Fail closed on omitted bindings; never borrow authority from the environment."""
     return _SESSION_HISTORY_DELIVERY.get() == "1"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Host-bound execution provenance & principal (process-ownership isolation).
+#
+# These are deliberately SEPARATE from the customizable session *source* tags
+# (platform/source/chat_id), which a message author can influence.  Provenance
+# and principal are minted by the trusted host at bind time and are the only
+# authority the process registry trusts to decide who owns a spawned handle.
+# Never derived from os.environ; fail closed to UNBOUND / "".
+# ──────────────────────────────────────────────────────────────────────────
+
+class SessionExecutionScope(Enum):
+    """Host-bound provenance, independent of customizable session source tags."""
+
+    UNBOUND = auto()
+    LOCAL_CLI = auto()
+    SESSION = auto()
+
+
+_EXECUTION_SCOPE: ContextVar[SessionExecutionScope] = ContextVar(
+    "session_execution_scope", default=SessionExecutionScope.UNBOUND
+)
+
+_EXECUTION_PRINCIPAL: ContextVar[str] = ContextVar("execution_principal", default="")
+
+
+def get_execution_scope() -> SessionExecutionScope:
+    """Return THIS task's provenance; never infer it from environment metadata."""
+    return _EXECUTION_SCOPE.get()
+
+
+@contextmanager
+def local_cli_scope() -> Iterator[None]:
+    """Bind the classic CLI entrypoint's lifetime, including copied tool workers.
+
+    A cron/gateway worker replaces this with SESSION on set/reset/clear, never
+    restoring inherited operator authority.  Its parent CLI keeps its own copy,
+    even after that worker engages the process-global subprocess-env latch.
+    """
+    token = _EXECUTION_SCOPE.set(SessionExecutionScope.LOCAL_CLI)
+    # Pin profile metadata before a worker disables ambient-env fallback.
+    profile_token = _SESSION_PROFILE.set(get_session_env("HERMES_SESSION_PROFILE"))
+    try:
+        yield
+    finally:
+        _SESSION_PROFILE.reset(profile_token)
+        _EXECUTION_SCOPE.reset(token)
+
+
+def bound_session_snapshot() -> dict[str, str]:
+    """Copy only THIS task's bound identity; never fall back to os.environ.
+
+    Unbound fields are absent; explicitly cleared fields remain empty.  The
+    execution principal is host-only and is never read from/exported to env.
+    """
+    result = {}
+    for name, var in _VAR_MAP.items():
+        value = var.get()
+        if value is not _UNSET:
+            result[name] = value
+    result["execution_principal"] = _EXECUTION_PRINCIPAL.get()
+    return result

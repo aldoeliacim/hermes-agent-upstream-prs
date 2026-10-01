@@ -1546,6 +1546,23 @@ class GatewayStartupMixin:
 
     async def _start_impl(self) -> bool:
         logger.info("Starting Hermes Gateway...")
+        # Isolation gate BEFORE any listener exists: a malformed/removed policy
+        # (or the sentinel demanding one) must refuse startup rather than come up
+        # half-isolated. With no policy configured this is inert.
+        from gateway.isolated_routing import isolation_unavailable, IsolatedRelayRuntime
+        if isolation_unavailable(self):
+            logger.error("Isolation policy unavailable; gateway startup refused")
+            return False
+        _iso_policy = getattr(self, "_isolated_policy", None)
+        if _iso_policy is not None:
+            try:
+                if getattr(self, "_isolated_runtime", None) is None:
+                    self._isolated_runtime = IsolatedRelayRuntime(
+                        _iso_policy, getattr(self, "adapters", {}))
+                await self._isolated_runtime.start()
+            except Exception:
+                logger.error("Isolation listener unavailable; gateway startup refused")
+                return False
         self._start_install_faulthandler()
         await self._start_log_startup_environment()
         if await self._abort_startup_if_shutdown_requested():

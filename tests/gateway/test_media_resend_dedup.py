@@ -524,3 +524,63 @@ def test_auto_append_lane_still_dedups_stale_media():
         history, history_offset=0, history_media_paths=paths
     )
     assert tags == [], f"stale auto-append tags re-emitted: {tags}"
+
+
+# ---------------------------------------------------------------------------
+# MEDIA:/FILE: symmetry of the runner's auto-append presence guard (#921)
+# ---------------------------------------------------------------------------
+#
+# ``TurnRunner._append_auto_media_tags`` early-returns when the model's own
+# final text already carries a delivery tag, so the auto-append lane does not
+# re-emit the same path and double-send. That presence guard used to be a bare
+# ``"MEDIA:" in final_response`` — blind to the ``FILE:`` alias, the ONLY
+# spelling the model is shown on the Anthropic OAuth lane. A FILE:-tagged reply
+# therefore skipped the guard and re-appended, double-sending the attachment.
+
+
+def _bare_runner():
+    """A TurnRunner instance whose __init__ is bypassed — the method under test
+    reads none of the instance/turn state, only its explicit arguments."""
+    from gateway.run_turn_runner import TurnRunner
+
+    return TurnRunner.__new__(TurnRunner)
+
+
+@pytest.mark.parametrize("marker", ["MEDIA", "FILE"])
+def test_runner_auto_append_suppressed_when_model_tagged(monkeypatch, marker):
+    """Both spellings in the model's final text must suppress auto-append
+    identically — no re-append, no double-send."""
+    import gateway.run as run_mod
+
+    def _boom(*_a, **_k):
+        raise AssertionError(
+            f"auto-append collected tags despite an existing {marker}: tag"
+        )
+
+    monkeypatch.setattr(run_mod, "_collect_auto_append_media_tags", _boom)
+
+    runner = _bare_runner()
+    final = f"Here is the file.\n{marker}:/tmp/report.pdf"
+    out = runner._append_auto_media_tags(
+        final, result={"messages": []}, agent_history=[], history_media_paths=set()
+    )
+    assert out == final, f"{marker}: reply was modified; guard did not suppress"
+
+
+def test_runner_auto_append_preserves_real_deliverable(monkeypatch):
+    """A plain-text reply (no tag) with a collectable tool-side tag must STILL
+    get the tag appended — the guard must not over-suppress real deliveries."""
+    import gateway.run as run_mod
+
+    monkeypatch.setattr(
+        run_mod,
+        "_collect_auto_append_media_tags",
+        lambda *_a, **_k: (["MEDIA:/tmp/voice.mp3"], False),
+    )
+
+    runner = _bare_runner()
+    final = "Here is your audio."
+    out = runner._append_auto_media_tags(
+        final, result={"messages": []}, agent_history=[], history_media_paths=set()
+    )
+    assert out == "Here is your audio.\nMEDIA:/tmp/voice.mp3"

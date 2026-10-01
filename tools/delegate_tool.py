@@ -443,6 +443,7 @@ def delegate_task(
     output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
     subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None, model: Optional[str] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
@@ -491,6 +492,24 @@ def delegate_task(
     # a per-call routing owner shaped like the delegation config section. Keep
     # the route and its fallback policy together through child construction.
     routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    if provider is not None or model is not None:
+        if provider is not None and (not isinstance(provider, str) or not provider.strip()):
+            return tool_error("provider must be a non-empty provider name.")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            return tool_error("model must be a non-empty model name.")
+        if provider is not None and model is None:
+            return tool_error("provider requires model: specify the model for the selected provider.")
+        # A changed provider owns its whole runtime route. Never combine the old
+        # provider's endpoint, auth, wire, ACP transport, request personality or
+        # fallback routes with the new one. Keep the original config untouched.
+        routing_cfg = dict(routing_cfg)
+        if provider is not None:
+            for key in ("model", "base_url", "api_key", "api_mode", "command", "args",
+                        "request_overrides", "fallback_providers"):
+                routing_cfg.pop(key, None)
+            routing_cfg["provider"] = provider.strip()
+        if model is not None:
+            routing_cfg["model"] = model.strip()
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -647,6 +666,14 @@ DELEGATE_TASK_SCHEMA = {
             # wrapped into a one-entry batch at dispatch, and a per-task `role` (legacy, ignored: capability is
             # depth-derived). Both unadvertised on purpose (old transcripts only); do not re-add. No maxItems — the
             # runtime limit (delegation.max_concurrent_children) is enforced with a clear error in delegate_task().
+            "provider": _p(
+                "string", "Optional provider for this invocation (requires model). Resolves its own auth, endpoint and API mode; "
+                "does not change global configuration."
+            ),
+            "model": _p(
+                "string", "Optional model for this invocation. Without provider, uses the configured "
+                "delegation provider (or inherited parent route); supply provider for a different provider."
+            ),
             "tasks": {
                 "type": "array",
                 "minItems": 1,

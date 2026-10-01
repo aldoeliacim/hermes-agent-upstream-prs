@@ -298,6 +298,7 @@ class AIAgent(
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str = None,
         capabilities: Dict[str, bool] | None = None, cwd: str | None = None,
+        skip_user_profile: bool = False,
         side_agent: bool = False, memory_manager=None,
         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
     ):
@@ -1052,6 +1053,11 @@ class AIAgent(
             from hermes_state_registry import release_or_close
             release_or_close(session_db)
 
+    # Todo-call names accepted when pairing a restored ``role: tool`` result with the
+    # assistant call that produced it. ``todo_list`` is the registered tool; ``todo`` is
+    # the pre-rename spelling, kept so older transcripts still hydrate.
+    _TODO_TOOL_NAMES = frozenset({"todo_list", "todo"})
+
     def _hydrate_todo_store(self, history: List[Dict[str, Any]]) -> None:
         """Replay the most recent todo tool response (the gateway builds a fresh AIAgent per message). Only
         results paired with an earlier assistant ``todo`` call count — a forged bare ``role: tool`` message
@@ -1111,10 +1117,11 @@ class AIAgent(
 
     @classmethod
     def _assistant_has_todo_tool_call(cls, assistant_msg: Dict[str, Any], tool_call_id: str) -> bool:
-        """True when the assistant message issued a ``todo`` call with this id."""
+        """True when the assistant message issued a todo call (``todo_list`` or legacy ``todo``) with this id."""
         tool_calls = assistant_msg.get("tool_calls")
         return isinstance(tool_calls, list) and any(
-            cls._get_tool_call_id_static(tc) == tool_call_id and cls._get_tool_call_name_static(tc) == "todo"
+            cls._get_tool_call_id_static(tc) == tool_call_id
+            and cls._get_tool_call_name_static(tc) in cls._TODO_TOOL_NAMES
             for tc in tool_calls
         )
 
@@ -1369,6 +1376,7 @@ class AIAgent(
             max_iterations=function_args.get("max_iterations"), role=function_args.get("role"),
             background=not (getattr(self, "_delegate_depth", 0) > 0), images=function_args.get("images"),
             action=function_args.get("action"),
+            provider=function_args.get("provider"), model=function_args.get("model"),
             subagent_id=function_args.get("subagent_id"), message=function_args.get("message"), parent_agent=self,
         )
 

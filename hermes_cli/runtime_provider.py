@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -296,6 +297,64 @@ _NO_ANTHROPIC_CREDENTIALS_MSG = ("No Anthropic credentials found. Run 'hermes au
                                  "or set ANTHROPIC_TOKEN / ANTHROPIC_API_KEY.")
 
 
+def _format_utc_timestamp(value: Any) -> str:
+    if value is None or value == "":
+        return ""
+    try:
+        timestamp = float(value)
+        if timestamp > 32_503_680_000:
+            timestamp /= 1000.0
+        return datetime.fromtimestamp(timestamp, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return str(value).strip()
+
+
+def _short_error_message(value: Any, *, limit: int = 120) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text if len(text) <= limit else text[: max(0, limit - 3)].rstrip() + "..."
+
+
+def _credential_pool_unavailable_error(provider: str, pool: CredentialPool) -> str:
+    display_provider = "Anthropic" if provider == "anthropic" else provider
+    try:
+        entries = list(pool.entries())
+    except Exception:
+        entries = []
+    count = len(entries)
+    noun = "credential" if count == 1 else "credentials"
+    message = (
+        f"{display_provider} credential pool has {count} configured {noun}, "
+        "but none are currently available"
+    )
+    details = []
+    for entry in entries[:4]:
+        label = (
+            str(getattr(entry, "label", "") or "").strip()
+            or str(getattr(entry, "id", "") or "").strip()[:8]
+            or "credential"
+        )
+        status = str(getattr(entry, "last_status", "") or "unavailable").strip()
+        reason = (
+            str(getattr(entry, "last_error_reason", "") or "").strip()
+            or str(getattr(entry, "last_error_code", "") or "").strip()
+        )
+        detail = f"{label}: {status}"
+        if reason:
+            detail += f" ({reason})"
+        reset_at = _format_utc_timestamp(getattr(entry, "last_error_reset_at", None))
+        if reset_at:
+            detail += f" until {reset_at}"
+        error_message = _short_error_message(getattr(entry, "last_error_message", ""))
+        if error_message:
+            detail += f" - {error_message}"
+        details.append(detail)
+    if len(entries) > 4:
+        details.append(f"{len(entries) - 4} more")
+    if details:
+        message += ": " + "; ".join(details)
+    return message if message.endswith((".", "!", "?")) else message + "."
+
+
 def _runtime(provider: str, api_mode: str, base_url: Any, api_key: Any, **extra: Any) -> Dict[str, Any]:
     """Build a resolved-runtime dict; ``extra`` carries source/requested_provider/provider-specific keys."""
     if is_actual_route(provider, base_url):
@@ -348,7 +407,7 @@ def _anthropic_cfg_base_url(model_cfg: Dict[str, Any]) -> str:
     return cfg_base_url if _anthropic_base_url_override_ok(cfg_base_url) else ""
 
 
-def _anthropic_token_or_raise(*, model: str | None = None) -> str:
+def _anthropic_token_or_raise(*, model: str | None = None, pool_unavailable_error: str = "") -> str:
     from agent.anthropic_credentials import resolve_anthropic_token
     token = resolve_anthropic_token(model=model)
     if not token:
@@ -357,6 +416,15 @@ def _anthropic_token_or_raise(*, model: str | None = None) -> str:
         if model and resolve_anthropic_token():
             raise AuthError(f"Anthropic credentials are rate-limited for {model}; "
                             "other Claude models remain available (see `hermes auth list`).")
+        # Configured-but-unavailable pool: report the actual per-entry status and reset
+        # times instead of the generic "no credentials" message, which would send a user
+        # who HAS configured accounts chasing a nonexistent auth problem.
+        if pool_unavailable_error:
+            raise AuthError(
+                pool_unavailable_error,
+                provider="anthropic",
+                code="credential_pool_unavailable",
+            )
         raise AuthError(_NO_ANTHROPIC_CREDENTIALS_MSG)
     return token
 
@@ -626,7 +694,7 @@ def _exchange_copilot_pool_entry(entry: Any, pool_api_key: str) -> str:
 
 
 def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[str, Any], explicit_api_key, explicit_base_url,
-                       target_model) -> Optional[Dict[str, Any]]:
+                       target_model, unavailable_state: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """Runtime from the provider's credential pool, or None to continue down the ladder."""
     should_use_pool = provider != "openrouter" or _openrouter_should_use_pool(requested_provider, model_cfg, explicit_api_key,
                                                                              explicit_base_url)
@@ -638,6 +706,11 @@ def _resolve_from_pool(provider: str, requested_provider: str, model_cfg: Dict[s
         return None
     entry = pool.select(model=target_model or None)
     if entry is None:
+        # Pool has configured credentials but none are selectable right now (all
+        # benched/cooling down). Record the diagnostic so the terminal Anthropic
+        # env rung can raise a specific error instead of a false "no credentials".
+        if unavailable_state is not None:
+            unavailable_state["message"] = _credential_pool_unavailable_error(provider, pool)
         return None
     pool_api_key = _pool_entry_api_key(entry)
     if provider == "nous":
@@ -811,7 +884,8 @@ def _azure_anthropic_env_key(model_cfg: Dict[str, Any]) -> str:
             or get_secret_str("ANTHROPIC_API_KEY", "").strip())
 
 
-def _anthropic_env_runtime(requested_provider: str, model_cfg: Dict[str, Any], target_model: str | None = None) -> Dict[str, Any]:
+def _anthropic_env_runtime(requested_provider: str, model_cfg: Dict[str, Any], target_model: str | None = None,
+                           pool_unavailable_error: str = "") -> Dict[str, Any]:
     """Native Anthropic (Messages API) from env/auth store; ``model.base_url`` honoured only when
     the configured provider is anthropic (else a Codex endpoint would leak into Anthropic requests)."""
     base_url = _anthropic_cfg_base_url(model_cfg) or _ANTHROPIC_DEFAULT_BASE_URL
@@ -823,7 +897,7 @@ def _anthropic_env_runtime(requested_provider: str, model_cfg: Dict[str, Any], t
             raise AuthError("No Azure Anthropic API key found. Set AZURE_ANTHROPIC_KEY or ANTHROPIC_API_KEY, or point "
                             "key_env/api_key_env in your config.yaml model section at a custom env var.")
     else:
-        token = _anthropic_token_or_raise(model=target_model)
+        token = _anthropic_token_or_raise(model=target_model, pool_unavailable_error=pool_unavailable_error)
     return _runtime("anthropic", "anthropic_messages", base_url, token, source="env", requested_provider=requested_provider)
 
 
@@ -1050,7 +1124,9 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
                                     target_model=target_model)
-    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model)
+    pool_unavailable: Dict[str, str] = {}
+    yield _resolve_from_pool(provider, requested_provider, model_cfg, explicit_api_key, explicit_base_url, target_model,
+                             pool_unavailable)
     swallowed_auth_error = None
     if provider in _OAUTH_RUNTIME_PROVIDERS:
         try:
@@ -1067,7 +1143,7 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     if _is_external_process_provider(provider):
         yield _resolve_external_process_runtime(provider, requested_provider)
     if provider == "anthropic":
-        yield _anthropic_env_runtime(requested_provider, model_cfg, target_model)
+        yield _anthropic_env_runtime(requested_provider, model_cfg, target_model, pool_unavailable.get("message", ""))
     if provider == "bedrock":
         yield _resolve_bedrock_runtime(requested_provider, model_cfg, target_model)
     pconfig = PROVIDER_REGISTRY.get(provider)

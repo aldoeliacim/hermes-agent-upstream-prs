@@ -74,7 +74,15 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
 
     pool = load_pool("openai-codex")
     assert pool.has_available() is False
-    assert pool.select() is None
+    # The explicit 7-day reset_at keeps the entry out of normal rotation
+    # (has_available() stays False). But it still carries a real token, so the
+    # last-resort floor returns it rather than None — sending the real token one
+    # more time beats a keyless 'Bearer None' request that loops on a misleading
+    # provider error.
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+    assert selected.runtime_api_key == "tok-1"
 
 
 
@@ -1278,6 +1286,16 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
+    # least_used must persist the incremented counter immediately: another process (or a
+    # restart) reloading auth.json otherwise sees the stale count and re-selects the same
+    # credential forever, defeating the strategy.
+    stored = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    stored_light = next(
+        candidate
+        for candidate in stored["credential_pool"]["openrouter"]
+        if candidate["id"] == "key-b"
+    )
+    assert stored_light["request_count"] == 11
 
 
 

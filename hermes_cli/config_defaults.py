@@ -865,6 +865,20 @@ DEFAULT_CONFIG = {
         # "(empty)" sentinel.
         "turn_completion_explainer": True,
         "show_cost": False,       # $ cost in the status bar
+        # Processing-reaction ack: the single emoji reaction an adapter sets on the user's
+        # message while it works the turn (a read-receipt, not a text bubble). One of:
+        #   "static" — the fixed 👀 → 👍/👎 lifecycle every reaction-capable adapter has always
+        #              shipped. The default, so this key is inert for existing deployments.
+        #   "smart"  — a deterministic, zero-LLM contextual picker (gateway/processing_reaction.py)
+        #              chooses the start emoji by message category (question/task/gracias/jaja/
+        #              urge/media…, Spanish + English) avoiding the emoji last used in that chat,
+        #              and varies the success emoji; failure stays an unambiguous 👎. Opt-in.
+        #   "off"    — no processing reaction at all.
+        # Per-platform `reactions` enable gates remain authoritative — this only chooses which
+        # emoji, not whether the adapter may react. Complements #29354 (WhatsApp) / #14667
+        # (Feishu). A fork with a reply-gate must suppress the start reaction on free-response
+        # group turns that may stay silent (this base has no reply-gate concept).
+        "processing_reaction": "static",
         "battery": False,         # battery read-out first in status bar; no-op w/o battery
         # Focus view (/focus): display-only. Pins tool_progress to "off", reports per-turn
         # hidden-line count, pins a "focus" status segment. focus_saved_tool_progress holds the mode

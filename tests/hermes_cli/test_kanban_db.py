@@ -469,6 +469,111 @@ def test_respawn_guard_defers_rate_limited_within_cooldown(
         assert kbd.check_respawn_guard(conn, tid) is None
 
 
+def test_respawn_guard_blocker_auth_is_bounded_by_cooldown(
+    kanban_home, monkeypatch,
+):
+    """``blocker_auth`` must not park a task forever.
+
+    The guard runs *before* any claim, so a deferred task records no new
+    failure and ``consecutive_failures`` never moves — an open-ended
+    ``blocker_auth`` deferral could therefore never reach the circuit breaker
+    (observed live: a filesystem "Permission denied" matched the blocker regex
+    and held four tasks in ``ready`` for 8 days). The deferral must stay
+    bounded: defer only while the failing run is younger than the same cooldown
+    the rate-limit path uses, then allow a probe so the breaker can trip with
+    the real error as the diagnosis.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="auth-bounded", assignee="a")
+        # A genuine auth/quota-flavored failure on the latest run. The outcome
+        # is ``blocked`` (not a local ``spawn_failed`` / ``gave_up``) so it
+        # reaches the auth text-match path rather than being short-circuited by
+        # the local-provenance guard (upstream PR 63268); this test isolates the
+        # bounded-cooldown aging, not the provenance classification.
+        kb.claim_task(conn, tid)
+        run_id = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='blocked', status='failed', "
+            "ended_at=? WHERE id=?",
+            (now, run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("provider authentication failed", tid),
+        )
+        conn.commit()
+
+        # Fresh failure (within cooldown) → defer with blocker_auth.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kbd.check_respawn_guard(conn, tid) == "blocker_auth"
+
+        # Failure older than the cooldown → the guard must release the task for
+        # a probe (None), NOT keep parking it, so the breaker can eventually
+        # trip on the real error.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 400)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
+def test_respawn_guard_latest_attempt_by_run_id_not_tied_timestamp(
+    kanban_home, monkeypatch,
+):
+    """The latest attempt is selected by monotonic run id, so an older quota /
+    rate-limit run cannot mask a newer local failure through tied or absent end
+    timestamps. Two runs share the same ``ended_at``; the newer (higher id) is
+    a plain crash, so the stamped rate-limit text on the older run must NOT
+    re-trap the task as ``rate_limit_cooldown``/``blocker_auth``.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+    now = 5_000_000
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tied-ts", assignee="a")
+        # Older run: rate_limited, same timestamp.
+        kb.claim_task(conn, tid)
+        older = kb.get_task(conn, tid).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='rate_limited', status='rate_limited', "
+            "ended_at=? WHERE id=?",
+            (now, older),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (tid,),
+        )
+        conn.commit()
+        # Newer run (higher id): a plain crash with the SAME ended_at.
+        kb.claim_task(conn, tid)
+        newer = kb.get_task(conn, tid).current_run_id
+        assert newer > older
+        conn.execute(
+            "UPDATE task_runs SET outcome='crashed', status='failed', "
+            "ended_at=? WHERE id=?",
+            (now, newer),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("pid killed by signal 9", tid),
+        )
+        conn.commit()
+
+        # Within the cooldown window: the newer crash wins over the older
+        # rate-limit run, so the guard must NOT report rate_limit_cooldown.
+        monkeypatch.setattr(_kb.time, "time", lambda: now + 100)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 @pytest.mark.parametrize(
     "error_text, expected",
     [
@@ -492,10 +597,20 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
     ordinary English words like "author"/"authored"/"authoring"/"authoritative"
     in worker progress prose, parking a healthy ``ready`` card forever (#117009).
     The auth family must be a curated set of real auth-failure tokens."""
-    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+    # Local layer: blocker_auth only defers while a DATED failure is fresh (an undated
+    # deferral records no failure, so the breaker can never trip and the card parks in
+    # ``ready`` forever). Give the text a fresh finished ``blocked`` run so this test still
+    # isolates what it is about: which words the curated pattern treats as auth failures.
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
 
     with kbc.connect() as conn:
         tid = kb.create_task(conn, title="prose", assignee="a")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at) "
+            "VALUES (?,'failed','blocked',?,?)",
+            (tid, now - 20, now - 10),
+        )
         conn.execute(
             "UPDATE tasks SET last_failure_error=? WHERE id=?",
             (error_text, tid),
@@ -504,13 +619,24 @@ def test_respawn_guard_blocker_auth_curated_not_open_stem(
         assert kbd.check_respawn_guard(conn, tid) == expected
 
 
-def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
+def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(
+    kanban_home, monkeypatch,
+):
     """A plain crash's captured stdout is context, not a diagnosis.
 
     ``_classify_dead_worker`` appends the worker's last output to the persisted
     failure text.  A benign command such as ``claude auth status`` must not turn
     an unrelated crash into a permanent auth guard on the next dispatch.
+
+    Cooldown is pinned to 0 so this exercises the auth-word *classification* on
+    the historic text-match path, independent of the bounded-deferral aging that
+    a nonzero cooldown adds. Provenance rule (upstream PR 63268): a local
+    ``spawn_failed`` / ``gave_up`` run is classified by its own outcome, so
+    auth/quota words in its captured text must NOT trip ``blocker_auth`` either
+    — only a genuine auth/quota failure (rate-limited run, or no run to age)
+    should.
     """
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
     with kbc.connect() as conn:
         crashed_id = kb.create_task(conn, title="crashed", assignee="a")
         kb.claim_task(conn, crashed_id)
@@ -545,10 +671,29 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
             "last_failure_error=? WHERE id=?",
             ("provider authentication failed", spawn_failed_id),
         )
+
+        gave_up_id = kb.create_task(conn, title="gave up", assignee="a")
+        kb.claim_task(conn, gave_up_id)
+        gave_up_run_id = kb.get_task(conn, gave_up_id).current_run_id
+        conn.execute(
+            "UPDATE task_runs SET outcome='gave_up', status='failed', ended_at=? "
+            "WHERE id=?",
+            (5_000_000, gave_up_run_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "last_failure_error=? WHERE id=?",
+            ("provider quota exceeded", gave_up_id),
+        )
         conn.commit()
 
+        # crashed: captured output is context, not a diagnosis -> not blocker_auth.
         assert kbd.check_respawn_guard(conn, crashed_id) is None
-        assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
+        # spawn_failed / gave_up: local provenance wins over auth-word text
+        # (upstream PR 63268) -> the task retries, it is NOT parked as blocker_auth.
+        assert kbd.check_respawn_guard(conn, spawn_failed_id) is None
+        assert kbd.check_respawn_guard(conn, gave_up_id) is None
 
 
 def test_infrastructure_spawn_refusal_never_charges_the_card(

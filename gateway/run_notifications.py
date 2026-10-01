@@ -12,11 +12,12 @@ import contextlib
 import dataclasses
 import json
 import logging
+import os
 import time
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, cast
+from typing import Any, Dict, Optional, Sequence, cast
 
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
@@ -26,6 +27,23 @@ from gateway.run_shutdown import _log_suppressed, _notice_target_key, _send_erro
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# The "nothing to add" instruction attached to every batched completion turn.
+#
+# "Absorb it silently" is ambiguous on a delivery path: it never says what to EMIT,
+# so "silently" gets satisfied by DESCRIBING the silence — a status line addressed to
+# nobody, which is exactly the leak this replaces. Naming the concrete emission (the
+# silence marker the gateway already suppresses, gateway/response_filters.py's
+# LIVE_GATEWAY_SILENT_MARKERS) and explicitly forbidding the narration shape gives the
+# model a legal action for "nothing to add" instead of leaving it to invent one — and
+# closes the class rather than one phrasing of it.
+_ABSORB_SILENTLY_INSTRUCTION = (
+    "If a result does not change the current conclusion, reply with exactly "
+    "NO_REPLY and nothing else — do NOT write a message saying there is "
+    "nothing new, that the work was already delivered, or that no reply is "
+    "needed; such a status line is addressed to nobody and must never reach "
+    "this chat."
+)
 
 # A failed /update leaves the previous version running; the full pip/git log stays on the host
 # (`hermes update` re-runs it in the terminal) and only a short tail is quoted in chat.
@@ -160,8 +178,249 @@ class GatewayNotificationsMixin:
         proceed: bool = True
         early_result: Optional[bool] = None
 
+    async def _notify_owner_home(
+        self, source, note: str, *, context: str, media: Sequence[str] = ()
+    ) -> bool:
+        """Deliver a note to the owner's home channel.
+
+        Prefers the origin platform's home, falls back to any configured home.
+        Fail-soft: a failure here loses one note, never breaks the turn.
+
+        Returns True when an owner home was the routing target (the note is
+        consumed — delivered, or lost to a delivery failure the caller must not
+        turn into a leak). False means NO configured home could receive it, so
+        the caller decides what the platform's own notice policy should do; that
+        is how a profile with no home channel keeps behaving like its standalone
+        gateway (see _deliver_platform_notice).
+        """
+        try:
+            from gateway.delivery import resolve_delivery_transport
+
+            platform = getattr(source, "platform", None)
+            order = []
+            if platform is not None and platform in self.config.platforms:
+                order.append(platform)
+            order += [p for p in self.config.platforms if p not in order]
+            for plat in order:
+                home = self.config.platforms[plat].home_channel
+                if not home or not home.chat_id:
+                    continue
+                transport = resolve_delivery_transport(plat, self.config, self.adapters)
+                if transport is None:
+                    continue
+                await transport.adapter.send(str(home.chat_id), note)
+                # Attachments ride as real files, never as a pasted local
+                # path. Each is fail-soft: the note already landed.
+                for path in media:
+                    if not os.path.isfile(path):
+                        logger.warning("%s: held attachment missing: %s", context, path)
+                        continue
+                    try:
+                        await transport.adapter.send_document(str(home.chat_id), path)
+                    except Exception:
+                        logger.warning(
+                            "%s: held attachment send failed: %s", context, path,
+                            exc_info=True,
+                        )
+                return True
+            logger.warning("%s: no home channel to notify", context)
+        except Exception:
+            logger.debug("Failed to notify owner home (%s)", context, exc_info=True)
+        return False
+
+    # Throttle window for the "register judges degraded" infra alert. A lane
+    # outage affects EVERY message equally, so one alert per window is enough;
+    # per-message alerts were the false-positive spam this replaces.
+    _REGISTER_DEGRADED_ALERT_WINDOW_S = 3600.0
+
+    async def _alert_register_judges_degraded(self, source, reason: str) -> None:
+        """Infra alert (throttled, no message body) that the register guard is degraded.
+
+        Fires when the register judges could not run (``no_lane_answered`` /
+        ``one_seat_unavailable``) AND nothing else flagged the content — i.e. the
+        reply was delivered with no confirming verdict purely because the guard's
+        own lanes were down. This is an INFRASTRUCTURE condition, not a possible
+        leak: it must never paste the delivered reply, and must not repeat for
+        every message during a single outage. One alert per window; the owner
+        learns the guard is degraded and can fix the lanes.
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        last = getattr(self, "_register_degraded_alert_ts", 0.0)
+        if now - last < self._REGISTER_DEGRADED_ALERT_WINDOW_S:
+            return  # already alerted within the window; stay silent
+        self._register_degraded_alert_ts = now
+        await self._notify_owner_home(
+            source,
+            "⚠️ Register guard degraded: the delivery judges could not return a "
+            f"verdict ({reason}). Replies are being delivered UNCHECKED until the "
+            "judge lanes answer again. This is an infra alert (no content shown); "
+            "it repeats at most once per hour. Check the OmniRoute judge lanes.",
+            context="register_judges_degraded",
+        )
+
+    async def _confirm_uncorroborated_hold(self, response, source, request_text, history: str = "") -> bool:
+        """Re-judge an UNCORROBORATED register hold (both_leak / judges_split with
+        regex=none) to tell a real leak from LLM noise.
+
+        LLM per-message register verdicts are noisy: a genuinely clean reply flips
+        to DELIVER when re-sampled, while a real owner-facing leak stays LEAK. We
+        re-run the judge up to 2 more times; the hold is CONFIRMED only if it
+        persists (majority still holds). Any confirmed-clean re-sample breaks the
+        hold, because silencing a contact on one noisy draw is the false-positive
+        class we are killing — the asymmetric cost favors delivering the contact's
+        reply, exactly as the module's fail-open docstring intends.
+
+        ``history`` MUST be the same recent-chat context the first verdict saw:
+        re-judging with LESS context than the original hold can only re-confirm
+        a context-blindness bug for commissioned work, never correct it.
+
+        Returns True  -> hold CONFIRMED (persisted): keep silencing + rerouting.
+                False -> NOT confirmed (flipped): deliver to the contact.
+
+        Fail-SAFE-for-contact: if re-judging cannot run (no live lanes / error),
+        return False so the contact is not silenced on an unconfirmable hold.
+        """
+        import asyncio as _asyncio
+        from gateway.delivery_judge import judge_delivery
+        from gateway.run_turn import _UNCORROBORATED_HOLD_REASONS
+
+        from gateway.response_filters import recipient_label_for_judge
+
+        recipient = recipient_label_for_judge(
+            getattr(source, "chat_id", None), getattr(source, "user_name", "")
+        )
+        holds = 0
+        samples = 0
+        for _ in range(2):
+            try:
+                v = await _asyncio.get_running_loop().run_in_executor(
+                    None,
+                    lambda: judge_delivery(response, recipient, request=request_text, history=history),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "owner_register_leak: re-judge sample errored (%s); "
+                    "treating as NOT-confirmed (contact not silenced on unconfirmable hold)",
+                    exc,
+                )
+                return False
+            if v is None:
+                return False
+            samples += 1
+            # A re-sample that DETERMINISTICALLY corroborates instantly confirms.
+            if v.hold and v.reason not in _UNCORROBORATED_HOLD_REASONS:
+                logger.warning(
+                    "owner_register_leak: re-judge produced DETERMINISTIC corroboration "
+                    "(reason=%s) — hold CONFIRMED",
+                    v.reason,
+                )
+                return True
+            if v.hold:
+                holds += 1
+            else:
+                # A clean re-sample: the verdict is unstable -> noise. Break in the
+                # contact's favor immediately.
+                logger.info(
+                    "owner_register_leak: re-judge sample #%d DELIVERED — hold is "
+                    "unstable (noise), NOT confirmed",
+                    samples,
+                )
+                return False
+        # Every re-sample still held with no clean flip -> the hold is stable.
+        confirmed = holds >= 1 and holds == samples
+        logger.warning(
+            "owner_register_leak: re-judge %d/%d still held — hold %s",
+            holds, samples, "CONFIRMED" if confirmed else "NOT confirmed",
+        )
+        return confirmed
+
+    async def _reroute_leaked_reply_to_owner(
+        self, source, response: str, *, salvaged: bool = False
+    ) -> None:
+        """Send content blocked by the register guard to the owner's home channel
+        instead of dropping it.
+
+        Truthful banner: the surface (DM vs group + title) and the disposition
+        (whole reply held vs. clean body delivered + stray note stripped) are
+        derived from the actual source and outcome — never hardcoded. A false
+        "referred to them in the third person / into their DM" label is what
+        sent past diagnosis chasing phantom recipients.
+        """
+        recipient = getattr(source, "user_name", None) or getattr(source, "user_id", "?")
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        title = getattr(source, "chat_name", None)
+        chat_id = getattr(source, "chat_id", None) or "?"
+        # The display name is the sender's self-chosen profile label (WhatsApp
+        # pushName), NOT a verified identity. Presenting it as the recipient
+        # ("meant for Hey!") sent diagnosis after a person who does not exist
+        # (2026-09-26). Routing is by chat_id — show that as the ground truth.
+        if chat_type and chat_type != "dm":
+            where = f"the {chat_type}"
+            if title:
+                where += f" _{title}_"
+            where += f" `{chat_id}`"
+            who = where
+        else:
+            where = f"DM `{chat_id}`"
+            who = f"{where} (profile name, unverified: _{recipient}_)"
+
+        # The body is kept so the owner can judge a false positive and resend,
+        # but the alert is itself an egress: never re-leak credentials that the
+        # guard just held (a Radarr key rode a held summary into this alert).
+        from agent.redact import redact_for_egress
+
+        # MEDIA: directives are delivery instructions, not prose. Pasted into
+        # the alert they exposed a local path and the owner never got the
+        # file (Kevin hold, 2026-09-27). Deliver them as attachments.
+        from gateway.platforms.base import BasePlatformAdapter
+
+        held, cleaned = BasePlatformAdapter.extract_media(response or "")
+        held_media = [path for path, _is_voice in held]
+        body = redact_for_egress(cleaned)
+        if held_media:
+            names = ", ".join(f"`{os.path.basename(p)}`" for p in held_media)
+            body += f"\n\n📎 Held attachment(s), not sent to them: {names}"
+
+        if salvaged:
+            note = (
+                f"✂️ Delivered a reply to {who} but stripped an internal note "
+                f"that leaked owner-facing content. They got the clean answer; "
+                f"the stripped part was:\n\n{body}"
+            )
+        else:
+            note = (
+                f"🔀 Held a reply for {who} — it leaked owner-facing content "
+                f"(internal register). Not delivered to them. What it said:\n\n{body}"
+            )
+        await self._notify_owner_home(
+            source, note, context="register_leak_reroute", media=held_media,
+        )
+
     async def _deliver_platform_notice(self, source, content: str) -> None:
-        """Deliver a setup/operational notice using platform-specific privacy rules."""
+        """Deliver a setup/operational notice using platform-specific privacy rules.
+
+        OPERATOR RAIL. Every notice on this rail — a subagent that timed out, a
+        credit band, a missing home channel — is written for the person who RUNS
+        the agent. On a non-owner DM the reader is a contact, and a contact must
+        never see an operator notice. So the rail routes by READER: owner chat →
+        here; anyone else → the owner's home channel, tagged with which chat it
+        concerns. Fail-closed reuses ``_should_skip_user_profile_for_source``
+        (True == the reader is not the proven owner).
+        """
+        try:
+            if self._should_skip_user_profile_for_source(source=source):
+                rerouted = await self._notify_owner_home(
+                    source,
+                    f"🛈 Notice from the chat with *{getattr(source, 'user_name', '?')}* "
+                    f"(not shown to them):\n\n{content}",
+                    context="platform_notice_rerouted",
+                )
+                if rerouted:
+                    return
+        except Exception:
+            logger.debug("platform notice reader check failed; delivering normally", exc_info=True)
         from gateway.run import _is_slack_ignored_channel
         adapter = self._delivery_adapter_for(source)
         if not adapter:
@@ -1649,8 +1908,19 @@ class GatewayNotificationsMixin:
                 f"\n- … and {omitted} more completion(s); inspect them with "
                 "the process tool if they affect the conclusion."
             )
-        lines.append("If a result does not change the current conclusion, absorb it silently.]")
+        lines.append(_ABSORB_SILENTLY_INSTRUCTION + "]")
         return "\n".join(lines)
+
+    @staticmethod
+    def _format_coalesced_async_delegations(blocks: list[str]) -> str:
+        """Join per-delegation formatted blocks into one consolidated turn."""
+        header = (
+            f"[IMPORTANT: {len(blocks)} background subagent delegations "
+            "completed for this session. Treat these results as one "
+            "completion batch and send at most one consolidated user-facing "
+            f"response. {_ABSORB_SILENTLY_INSTRUCTION}]"
+        )
+        return "\n\n".join([header, *blocks])
 
     def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
         """Extend a successful primary delivery claim to its batched siblings."""
@@ -1818,13 +2088,7 @@ class GatewayNotificationsMixin:
             blocks.append(synth_text)
         if not siblings:
             return await self._deliver_completion_notification(primary_text, primary_evt)
-        header = (
-            f"[IMPORTANT: {len(blocks)} background subagent delegations "
-            "completed for this session. Treat these results as one "
-            "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, absorb it silently.]"
-        )
-        consolidated = "\n\n".join([header, *blocks])
+        consolidated = self._format_coalesced_async_delegations(blocks)
         delivered = await self._deliver_completion_notification(
             consolidated, primary_evt, sibling_claims=siblings,
         )

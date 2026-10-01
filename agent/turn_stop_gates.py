@@ -76,6 +76,30 @@ def _pre_verify_nudge(agent, final_response, attempt: int) -> Optional[str]:
     return None
 
 
+def _unfinished_todo_nudge(agent) -> Optional[str]:
+    """One advisory reconciliation per turn for todos this turn left unfinished.
+
+    Opt-out rides ``_stall_guards`` with the other continuation guards. The check is
+    once per TURN, not per revision or per consecutive final: a refusal or blocker can
+    end the next attempt with the plan still unfinished, and re-asking would loop.
+    """
+    if not bool(getattr(agent, "_stall_guards", True)):
+        return None
+    if getattr(agent, "_todo_reconciliation_attempted", False):
+        return None
+    baseline = getattr(agent, "_todo_baseline", None)
+    store = getattr(agent, "_todo_store", None)
+    if not isinstance(baseline, dict) or store is None:
+        return None
+    try:
+        from agent.agent_runtime_helpers import build_unfinished_todo_nudge
+
+        return build_unfinished_todo_nudge(baseline, store.snapshot())
+    except Exception:
+        logger.debug("unfinished-todo reconciliation check failed", exc_info=True)
+        return None
+
+
 def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     """Workers must end with a terminal board tool (kanban_complete / kanban_block /
     kanban_request_review / kanban_request_changes); a narrated stop is recorded
@@ -89,6 +113,34 @@ def _kanban_stop_nudge(agent, messages) -> Optional[str]:
     except Exception:
         logger.debug("kanban stop-loop check failed", exc_info=True)
         return None
+
+
+def _reply_decision_nudge(agent) -> Optional[str]:
+    """Tool-gated free-response turn that stopped with a text answer but has not yet
+    delivered it: force one explicit delivery decision (call send_message, or record
+    silence) before the fail-loud fallback silently discards the tail. Inert outside a
+    tool-gated turn and once a decision was already made this turn (#921)."""
+    try:
+        from agent.reply_decision_stop import (
+            build_reply_decision_nudge, reply_decision_nudge_enabled
+        )
+        from cron.agent_turn_context import is_cron_agent_turn
+        from tools.approval import get_turn_delivery_state, is_reply_tool_gated_turn
+
+        # Cron owns delivery of its final response and deliberately does not expose
+        # send_message, so nudging a cron turn to "call send_message" gives it
+        # contradictory orders (it burns turns, or fails the job).
+        if is_cron_agent_turn() or not is_reply_tool_gated_turn() or not reply_decision_nudge_enabled():
+            return None
+        _state = get_turn_delivery_state()
+        return build_reply_decision_nudge(
+            tool_sends=getattr(_state, "tool_sends", 0),
+            decided_silent=getattr(_state, "decided_silent", 0),
+            attempts=getattr(agent, "_reply_decision_nudges", 0),
+        )
+    except Exception:
+        logger.debug("reply-decision stop-loop check failed", exc_info=True)
+    return None
 
 
 def _append_interim_answer(agent, final_msg, messages, conversation_history, flush_fail_msg: str) -> None:
@@ -151,6 +203,32 @@ def apply_stop_gates(
         logger.debug("pre_verify nudge issued (attempt %d)", agent._pre_verify_nudges)
         return verdict
 
+    _todo_nudge = _unfinished_todo_nudge(agent)
+    if _todo_nudge:
+        # Latch BEFORE continuing: one check per turn even if the model revises the plan.
+        agent._todo_reconciliation_attempted = True
+        # Neither half enters ``messages``. The candidate answer was superseded by this
+        # continuation and the advisory is internal, so both ride the REQUEST COPY only
+        # (see agent/turn_request_assembly.py) — keeping session history, incremental flushes,
+        # compaction and later turns clean, while preserving assistant/user alternation
+        # and leaving the cached prompt prefix and tool schemas untouched.
+        agent._todo_reconciliation_messages = [
+            {"role": "assistant", "content": final_response},
+            {"role": "user", "content": _todo_nudge},
+        ]
+        logger.info("unfinished-todo reconciliation nudge issued")
+        # The candidate is preserved as the budget-exhaustion fallback: if the continuation
+        # runs out of iterations the user still gets the real reply, never a summary that
+        # would imply the work finished.
+        return StopGateVerdict(
+            continue_turn=True,
+            final_response=None,
+            pending_verification_response=final_response,
+            pending_verification_response_previewed=agent._interim_content_was_streamed(
+                final_response or ""
+            ),
+        )
+
     _kanban_nudge = _kanban_stop_nudge(agent, messages)
     if _kanban_nudge:
         agent._kanban_stop_nudges = getattr(agent, "_kanban_stop_nudges", 0) + 1
@@ -167,6 +245,17 @@ def apply_stop_gates(
             "⚠️ Kanban worker tried to exit without a terminal board call "
             "(kanban_complete/kanban_request_review/kanban_block) — nudging to finish"
         )
+        return verdict
+
+    _reply_nudge = _reply_decision_nudge(agent)
+    if _reply_nudge:
+        agent._reply_decision_nudges = getattr(agent, "_reply_decision_nudges", 0) + 1
+        final_msg["finish_reason"] = "reply_decision_required"
+        _append_interim_answer(
+            agent, final_msg, messages, conversation_history, "reply-decision interim flush failed"
+        )
+        verdict = _continue(_reply_nudge, "_reply_decision_synthetic")
+        logger.debug("reply-decision stop-loop nudge issued (attempt %d)", agent._reply_decision_nudges)
         return verdict
     return StopGateVerdict(
         continue_turn=False, final_response=final_response,

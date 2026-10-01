@@ -18,6 +18,13 @@ logger = logging.getLogger("tools.mcp_tool")
 _mcp_stderr_log_fh: Dict[str, Any] = {}  # profile home key -> handle
 _mcp_stderr_log_lock = threading.Lock()
 
+# Rotate the shared stderr log at open time once it exceeds this size. The handle is
+# held open for the life of the process (asyncio wires the child's stderr straight to
+# it), so opening is the ONLY moment rotation is possible: growth is bounded to ~cap per
+# gateway lifetime plus one archived generation (.log.1). Without it the file grows
+# forever; no logrotate config knows about ~/.hermes/logs/mcp-stderr.log.
+_MCP_STDERR_LOG_MAX_BYTES = 5 * 1024 * 1024
+
 
 def _get_mcp_stderr_log() -> Any:
     """Shared append-mode handle for MCP subprocess stderr, cached until shutdown PER PROFILE HOME (a
@@ -31,8 +38,16 @@ def _get_mcp_stderr_log() -> Any:
             try:
                 log_dir = get_hermes_home() / "logs"
                 mkdir_under_hermes_home(log_dir)
+                log_path = log_dir / "mcp-stderr.log"
+                # One-shot rotation BEFORE the long-lived handle is opened: keep a single
+                # previous generation so recent history stays debuggable.
+                try:
+                    if log_path.stat().st_size > _MCP_STDERR_LOG_MAX_BYTES:
+                        log_path.replace(log_path.with_suffix(".log.1"))
+                except OSError:
+                    pass  # Missing file or a racing writer; append mode handles both.
                 # Line-buffered so output lands promptly; errors="replace" tolerates garbled binary.
-                fh = open(log_dir / "mcp-stderr.log", "a", encoding="utf-8", errors="replace", buffering=1)
+                fh = open(log_path, "a", encoding="utf-8", errors="replace", buffering=1)
                 fh.fileno()  # confirm a real fd before committing
             except Exception as exc:  # pragma: no cover — best-effort fallback
                 logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)

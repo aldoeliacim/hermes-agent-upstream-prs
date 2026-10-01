@@ -35,11 +35,13 @@ import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
 import {
   addMentions,
+  bridgeSourceHash,
   buildPollPayload,
   createReconnectScheduler,
   createVersionResolver,
   buildLocationPayload,
   buildTextSendPayload,
+  bridgeTokenOk,
   createBoundedMessageStore,
   createQuotedMediaCache,
   extractBridgeEvent,
@@ -50,6 +52,28 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  normalizeChatJid,
+  getStatusAuthor,
+  buildDeleteKey,
+  buildStarPayload,
+  buildArchivePayload,
+  buildMutePayload,
+  buildPinPayload,
+  buildMarkReadPayload,
+  isValidGroupSetting,
+  isValidGroupParticipantAction,
+  normalizePhoneForCheck,
+  isValidPrivacyUpdate,
+  privacySockMethodName,
+  isValidBlockAction,
+  buildContactPayload,
+  isValidEphemeralSeconds,
+  isValidJoinApprovalMode,
+  isValidMemberAddMode,
+  isValidJoinRequestAction,
+  isValidPresenceType,
+  buildDisableLinkPreviewsPayload,
+  installOutboundTextPolicy,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -107,16 +131,23 @@ const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
 // keeps serving the old behavior forever).
 let SCRIPT_HASH = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
-    .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
+  SCRIPT_HASH = bridgeSourceHash(path.dirname(fileURLToPath(import.meta.url)));
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
 const WHATSAPP_MODE = getArg('mode', process.env.WHATSAPP_MODE || 'self-chat'); // "bot" or "self-chat"
 const WHATSAPP_DM_POLICY = String(process.env.WHATSAPP_DM_POLICY || 'open').trim().toLowerCase();
 const WHATSAPP_GROUP_POLICY = String(process.env.WHATSAPP_GROUP_POLICY || 'pairing').trim().toLowerCase();
+
+// Loopback capability token. The bridge binds to loopback, but any local process (including the
+// agent's own execute_code/terminal subprocess) can reach it and POST /send with an arbitrary
+// chatId — speaking as the user. When WHATSAPP_BRIDGE_TOKEN is set (the gateway always sets it per
+// spawn), state-changing endpoints require a matching X-Hermes-Bridge-Token header. Open, read-only
+// prefixes (health + inbound polling) stay unauthenticated so the poller and health handshake work.
+const BRIDGE_TOKEN = (process.env.WHATSAPP_BRIDGE_TOKEN || '').trim();
+const BRIDGE_TOKEN_BUF = BRIDGE_TOKEN ? Buffer.from(BRIDGE_TOKEN) : null;
+// bridgeTokenOk(tokenBuf, presented) is imported from bridge_helpers.js (single source of truth,
+// covered by BRIDGE_SOURCE_FILES so a change here bumps the reuse hash).
 const ALLOWED_USERS = parseAllowedUsers(process.env.WHATSAPP_ALLOWED_USERS || '');
 // Group authorization is by group JID, not by every participant's JID.  The
 // Python adapter still applies group policy and mention rules after intake.
@@ -261,7 +292,46 @@ const MAX_QUEUE_SIZE = 100;
 // sustained sending.
 const recentlySentIds = createOutboundIdTracker(512);
 const recentlyProcessedPollUpdates = createOutboundIdTracker(512);
-const messageStore = createBoundedMessageStore(512);
+const MAX_STORED_MESSAGES = parseInt(process.env.WHATSAPP_MESSAGE_STORE_MAX || '5000', 10);
+const MESSAGE_STORE_TTL_MS = parseInt(
+  process.env.WHATSAPP_MESSAGE_STORE_TTL_MS || String(24 * 60 * 60 * 1000),
+  10,
+);
+const messageStore = createBoundedMessageStore(MAX_STORED_MESSAGES, {
+  ttlMs: MESSAGE_STORE_TTL_MS,
+});
+
+// ── Native-surface shims (ported from live ref 828ce02edf) ──
+// The restored bridge routes call these standalone helpers rather than the
+// messageStore methods directly. IQ operations (chatModify, group/profile
+// mutations, onWhatsApp) are wrapped in a race with a hard timeout so a
+// stalled WhatsApp IQ can never hang a bridge request forever.
+const IQ_TIMEOUT_MS = parseInt(process.env.WHATSAPP_IQ_TIMEOUT_MS || '30000', 10);
+function withIqTimeout(promiseFactory, timeoutMs = IQ_TIMEOUT_MS) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`request timed out after ${timeoutMs / 1000}s`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promiseFactory(), timeoutPromise]).finally(() => clearTimeout(timer));
+}
+function rememberMessage(msg, now = Date.now()) {
+  messageStore.remember(msg, now);
+}
+function resolveStoredMessage(chatId, messageId, now = Date.now()) {
+  // Read-only peek: resolving a reaction target must not shuffle LRU recency.
+  // Chat-scoped: a stanza id is unique only WITHIN a chat.
+  const msg = messageStore.peek(messageId, now);
+  if (!msg) return undefined;
+  const target = normalizeChatJid(chatId || '');
+  if (!target || normalizeChatJid(msg.key?.remoteJid || '') !== target) return undefined;
+  return msg;
+}
+function latestStoredInboundMessage(chatId, now = Date.now()) {
+  return messageStore.latestInboundForChat(chatId, { now }) || undefined;
+}
 // Bounded cache of already-downloaded inbound media, so a later reply to an
 // uncaptioned photo/video/document/voice note can still surface the original
 // file — see createQuotedMediaCache's doc comment in bridge_helpers.js.
@@ -404,6 +474,12 @@ async function startSocket() {
     },
   });
 
+  // General outbound link-preview suppression: Baileys otherwise fetches URLs
+  // from the bot's own IP to build a preview (a content-driven network request
+  // that runs inside sendMessage, after any caller scope check). Applies to
+  // every plain-text send unless the caller supplied an explicit preview.
+  installOutboundTextPolicy(sock);
+
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
   sock.ev.on('connection.update', (update) => {
@@ -452,6 +528,47 @@ async function startSocket() {
       emitPairEvent({ event: 'connected', user: connectedUser });
       if (!PAIR_JSON) {
         console.log('✅ WhatsApp connected!');
+      }
+      // Ensure read receipts are enabled account-side, otherwise readMessages()
+      // silently downgrades a real 'read' receipt to 'read-self' and the
+      // sender never sees blue ticks. Complements the native SEND_READ_RECEIPTS
+      // /read flow (the adapter posts /read only after its intake policy
+      // accepts a message); without this account-side setting that flow
+      // half-works: receipts send but render as unread to the sender.
+      if (SEND_READ_RECEIPTS && !PAIR_ONLY) {
+        (async () => {
+          try {
+            const privacy = await sock.fetchPrivacySettings(true);
+            if (privacy?.readreceipts !== 'all') {
+              await sock.updateReadReceiptsPrivacy('all');
+              console.log(`🔵 Read receipts privacy was '${privacy?.readreceipts}', set to 'all' (blue ticks enabled).`);
+            } else if (WHATSAPP_DEBUG) {
+              console.log("🔵 Read receipts privacy already 'all'.");
+            }
+          } catch (err) {
+            console.error('[bridge] Could not verify/set read-receipts privacy:', err?.message || err);
+          }
+          // Presence must be asserted 'available' or NO receipt ever renders.
+          // Baileys keeps an internal sendActiveReceipts=false until a GLOBAL
+          // 'available' presence is sent (messages-recv.js flips it only on
+          // connection.update{isOnline} — which only sendPresenceUpdate
+          // ('available') emits; per-chat 'composing' takes the chatstate
+          // branch and never touches it). With markOnlineOnConnect=false and
+          // no presence call, every inbound auto-ack goes out as
+          // type='inactive': the sender never sees the delivered double-tick
+          // and reads can't upgrade to blue — regardless of privacy settings
+          // or the /read flow. Diagnosed live 2026-08-08 ("I don't see blue
+          // ticks, nor the delivered ticks"). Re-runs on every reconnect
+          // because Baileys resets the flag on socket close. Trade-off: the
+          // account shows "online" while the bridge is up — fine for a
+          // dedicated agent number, and gated behind the same opt-in.
+          try {
+            await sock.sendPresenceUpdate('available');
+            console.log('🟢 Presence asserted available (delivery/read receipts active).');
+          } catch (err) {
+            console.error('[bridge] Could not assert available presence:', err?.message || err);
+          }
+        })();
       }
       if (PAIR_ONLY) {
         if (!PAIR_JSON) {
@@ -825,6 +942,20 @@ app.use((req, res, next) => {
   next();
 });
 
+// Capability-token gate. Runs AFTER the loopback host check. When a token is configured, every
+// state-changing endpoint (/send, /edit, /react, /send-media, /send-poll, /send-location, /typing,
+// /read) requires a matching X-Hermes-Bridge-Token. Read-only / handshake prefixes stay open so the
+// inbound poller (/messages), chat backfill (/chat) and health/scriptHash handshake (/health) work
+// without the secret. With no token configured this is a no-op (back-compat).
+const TOKEN_OPEN_PREFIXES = ['/health', '/messages', '/chat', '/groups'];
+app.use((req, res, next) => {
+  if (!BRIDGE_TOKEN_BUF) return next();
+  const isOpen = TOKEN_OPEN_PREFIXES.some((p) => req.path === p || req.path.startsWith(p + '/'));
+  if (isOpen) return next();
+  if (bridgeTokenOk(BRIDGE_TOKEN_BUF, req.headers['x-hermes-bridge-token'])) return next();
+  return res.status(401).json({ error: 'Unauthorized: missing or invalid bridge token' });
+});
+
 // Poll for new messages (long-poll style)
 app.get('/messages', (req, res) => {
   const msgs = messageQueue.splice(0, messageQueue.length);
@@ -1094,6 +1225,741 @@ app.post('/read', async (req, res) => {
 });
 
 // Chat info
+// ── Restored WhatsApp native surface routes (ported from live ref 828ce02edf) ──
+// Every route below sits AFTER the capability-token middleware (app.use guard),
+// so each is fail-closed: a matching X-Hermes-Bridge-Token is required unless the
+// path matches a TOKEN_OPEN_PREFIX (/health /messages /chat /groups).
+
+app.post('/react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, messageId, emoji } = req.body;
+  if (!chatId || emoji === undefined) {
+    return res.status(400).json({ error: 'chatId and emoji are required' });
+  }
+  let target;
+  if (messageId) {
+    target = resolveStoredMessage(chatId, messageId);
+    if (!target) return res.status(404).json({ error: 'Referenced message not found in bridge cache' });
+  } else {
+    target = latestStoredInboundMessage(chatId);
+    if (!target) return res.status(404).json({ error: 'No recent message to react to in this chat' });
+  }
+  try {
+    const sent = await sendWithTimeout(chatId, { react: { text: emoji || '', key: target.key } });
+    trackSentMessageId(sent);
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/status-reply', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { statusMessageId, statusAuthorJid, message } = req.body;
+  if (!statusMessageId || !message) {
+    return res.status(400).json({ error: 'statusMessageId and message are required' });
+  }
+  const statusMsg = resolveStoredMessage('status@broadcast', statusMessageId)
+    || resolveStoredMessage('status@s.whatsapp.net', statusMessageId);
+  if (!statusMsg) return res.status(404).json({ error: 'Referenced status not found in bridge cache' });
+  const authorJid = getStatusAuthor(statusMsg, statusAuthorJid);
+  if (!authorJid) return res.status(400).json({ error: 'Could not determine status author JID' });
+  try {
+    const sent = await sendWithTimeout(authorJid, { text: formatOutgoingMessage(message) }, { quoted: statusMsg });
+    rememberMessage(sent);
+    trackSentMessageId(sent);
+    res.json({ success: true, messageId: sent?.key?.id, chatId: authorJid, quoted: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/status-react', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { statusMessageId, statusAuthorJid, emoji } = req.body;
+  if (!statusMessageId || emoji === undefined) {
+    return res.status(400).json({ error: 'statusMessageId and emoji are required' });
+  }
+  const statusMsg = resolveStoredMessage('status@broadcast', statusMessageId)
+    || resolveStoredMessage('status@s.whatsapp.net', statusMessageId);
+  if (!statusMsg) return res.status(404).json({ error: 'Referenced status not found in bridge cache' });
+  const authorJid = getStatusAuthor(statusMsg, statusAuthorJid);
+  if (!authorJid) return res.status(400).json({ error: 'Could not determine status author JID' });
+  try {
+    const ownJid = normalizeWhatsAppId(sock.user?.id || '');
+    const statusJidList = Array.from(new Set([authorJid, ownJid].filter(Boolean)));
+    const sent = await enqueueSend(() => sock.sendMessage(
+      'status@broadcast',
+      { react: { text: emoji, key: statusMsg.key } },
+      { statusJidList },
+    ));
+    trackSentMessageId(sent);
+    res.json({ success: true, messageId: sent?.key?.id, statusJidList });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/post-status', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { text, backgroundColor, font, statusJidList } = req.body;
+  if (!text || !Array.isArray(statusJidList) || statusJidList.length === 0) {
+    return res.status(400).json({ error: 'text and a non-empty explicit statusJidList are required' });
+  }
+  try {
+    const recipients = Array.from(new Set(statusJidList.map(normalizeWhatsAppId).filter(Boolean)));
+    const sent = await enqueueSend(() => sock.sendMessage(
+      'status@broadcast',
+      { text },
+      { statusJidList: recipients, backgroundColor, font, broadcast: true },
+    ));
+    rememberMessage(sent);
+    res.json({ success: true, messageId: sent?.key?.id, statusJidList: recipients });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/delete', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, messageId, fromMe, participant } = req.body;
+  const key = buildDeleteKey({ chatId, messageId, fromMe, participant });
+  if (!key) {
+    return res.status(400).json({ error: 'chatId, messageId, and a boolean fromMe are required' });
+  }
+  try {
+    await sendWithTimeout(chatId, { delete: key });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/star', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, messages, star } = req.body;
+  const payload = buildStarPayload({ messages, star });
+  if (!chatId || !payload) {
+    return res.status(400).json({ error: 'chatId and a non-empty messages list ({id, fromMe}) are required' });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, chatId));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/archive', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, archive } = req.body;
+  const lastMessage = latestStoredInboundMessage(chatId);
+  const payload = buildArchivePayload({ archive, lastMessage });
+  if (!payload) {
+    return res.status(chatId && !lastMessage ? 409 : 400).json({
+      error: !chatId
+        ? 'chatId is required'
+        : !lastMessage
+          ? 'No cached message for this chat to anchor the archive update (send/receive at least once first)'
+          : 'archive must be a boolean',
+    });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, chatId));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/mute', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, muteMs } = req.body;
+  const payload = buildMutePayload({ muteMs: muteMs === null ? null : Number(muteMs) });
+  if (!chatId || !payload) {
+    return res.status(400).json({ error: 'chatId and a positive muteMs (or null to unmute) are required' });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, chatId));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/pin', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, pin } = req.body;
+  const payload = buildPinPayload({ pin });
+  if (!chatId || !payload) {
+    return res.status(400).json({ error: 'chatId and a boolean pin are required' });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, chatId));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/mark-read', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { chatId, read } = req.body;
+  const lastMessage = latestStoredInboundMessage(chatId);
+  const payload = buildMarkReadPayload({ read, lastMessage });
+  if (!payload) {
+    return res.status(chatId && !lastMessage ? 409 : 400).json({
+      error: !chatId
+        ? 'chatId is required'
+        : !lastMessage
+          ? 'No cached message for this chat to anchor the read-state update'
+          : 'read must be a boolean',
+    });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, chatId));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/check-numbers', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { phoneNumbers } = req.body;
+  if (!Array.isArray(phoneNumbers) || phoneNumbers.length === 0) {
+    return res.status(400).json({ error: 'phoneNumbers (non-empty array) is required' });
+  }
+  const jids = phoneNumbers.map(normalizePhoneForCheck).filter(Boolean);
+  if (jids.length === 0) {
+    return res.status(400).json({ error: 'No checkable numbers (LIDs are not supported by onWhatsApp)' });
+  }
+  try {
+    const results = await withIqTimeout(() => sock.onWhatsApp(...jids));
+    res.json({ success: true, results: results || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/profile/name', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { name } = req.body;
+  if (!name || typeof name !== 'string') {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  try {
+    await withIqTimeout(() => sock.updateProfileName(name));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/profile/status', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { status } = req.body;
+  if (typeof status !== 'string') {
+    return res.status(400).json({ error: 'status is required' });
+  }
+  try {
+    await withIqTimeout(() => sock.updateProfileStatus(status));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/profile/picture', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { filePath, jid } = req.body;
+  if (!filePath) return res.status(400).json({ error: 'filePath is required' });
+  if (!existsSync(filePath)) return res.status(404).json({ error: `File not found: ${filePath}` });
+  try {
+    const targetJid = jid || normalizeWhatsAppId(sock.user?.id || '');
+    await withIqTimeout(() => sock.updateProfilePicture(targetJid, { url: filePath }));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/profile/picture/remove', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const targetJid = req.body?.jid || normalizeWhatsAppId(sock.user?.id || '');
+    await withIqTimeout(() => sock.removeProfilePicture(targetJid));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/create', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { subject, participants } = req.body;
+  if (!subject || !Array.isArray(participants) || participants.length === 0) {
+    return res.status(400).json({ error: 'subject and a non-empty participants array are required' });
+  }
+  try {
+    const metadata = await withIqTimeout(() => sock.groupCreate(subject, participants));
+    res.json({ success: true, id: metadata.id, subject: metadata.subject });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/participants', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const groupId = req.params.id;
+  const { participants, action } = req.body;
+  if (!Array.isArray(participants) || participants.length === 0 || !isValidGroupParticipantAction(action)) {
+    return res.status(400).json({ error: 'participants (non-empty array) and a valid action (add/remove/promote/demote) are required' });
+  }
+  try {
+    const results = await withIqTimeout(() => sock.groupParticipantsUpdate(groupId, participants, action));
+    res.json({ success: true, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/subject', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { subject } = req.body;
+  if (!subject) return res.status(400).json({ error: 'subject is required' });
+  try {
+    await withIqTimeout(() => sock.groupUpdateSubject(req.params.id, subject));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/description', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    await withIqTimeout(() => sock.groupUpdateDescription(req.params.id, req.body?.description || undefined));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/leave', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    await withIqTimeout(() => sock.groupLeave(req.params.id));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/groups/:id/invite-code', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const code = req.query.reset === 'true'
+      ? await withIqTimeout(() => sock.groupRevokeInvite(req.params.id))
+      : await withIqTimeout(() => sock.groupInviteCode(req.params.id));
+    res.json({ success: true, code, link: code ? `https://chat.whatsapp.com/${code}` : null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/setting', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { setting } = req.body;
+  if (!isValidGroupSetting(setting)) {
+    return res.status(400).json({ error: 'setting must be one of announcement/not_announcement/locked/unlocked' });
+  }
+  try {
+    await withIqTimeout(() => sock.groupSettingUpdate(req.params.id, setting));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/ephemeral', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const seconds = Number(req.body?.seconds);
+  if (!isValidEphemeralSeconds(seconds)) {
+    return res.status(400).json({ error: 'seconds must be one of 0 (off), 86400 (24h), 604800 (7d), 7776000 (90d)' });
+  }
+  try {
+    await withIqTimeout(() => sock.groupToggleEphemeral(req.params.id, seconds));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/member-add-mode', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { mode } = req.body;
+  if (!isValidMemberAddMode(mode)) {
+    return res.status(400).json({ error: 'mode must be all_member_add or admin_add' });
+  }
+  try {
+    await withIqTimeout(() => sock.groupMemberAddMode(req.params.id, mode));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/join-approval-mode', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { mode } = req.body;
+  if (!isValidJoinApprovalMode(mode)) {
+    return res.status(400).json({ error: "mode must be 'on' or 'off'" });
+  }
+  try {
+    await withIqTimeout(() => sock.groupJoinApprovalMode(req.params.id, mode));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/groups/:id/join-requests', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const requests = await withIqTimeout(() => sock.groupRequestParticipantsList(req.params.id));
+    res.json({ success: true, requests: requests || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/:id/join-requests', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { participants, action } = req.body;
+  if (!Array.isArray(participants) || participants.length === 0 || !isValidJoinRequestAction(action)) {
+    return res.status(400).json({ error: 'participants (non-empty array) and a valid action (approve/reject) are required' });
+  }
+  try {
+    const results = await withIqTimeout(() => sock.groupRequestParticipantsUpdate(req.params.id, participants, action));
+    res.json({ success: true, results });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/privacy', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { category, value } = req.body;
+  if (!isValidPrivacyUpdate(category, value)) {
+    return res.status(400).json({ error: 'category/value pair is not a recognized WhatsApp privacy setting' });
+  }
+  try {
+    const method = privacySockMethodName(category);
+    await withIqTimeout(() => sock[method](value));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/privacy', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const settings = await withIqTimeout(() => sock.fetchPrivacySettings(req.query.force === 'true'));
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/block', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { jid, action } = req.body;
+  if (!jid || !isValidBlockAction(action)) {
+    return res.status(400).json({ error: 'jid and action (block/unblock) are required' });
+  }
+  try {
+    await withIqTimeout(() => sock.updateBlockStatus(jid, action));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/blocklist', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const list = await withIqTimeout(() => sock.fetchBlocklist());
+    res.json({ success: true, blocklist: list || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/contact', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { jid, name, remove } = req.body;
+  const payload = buildContactPayload({ name, remove });
+  if (!jid || !payload) {
+    return res.status(400).json({ error: 'jid is required, plus either a non-empty name or remove:true' });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, jid));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/default-ephemeral', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const seconds = Number(req.body?.seconds);
+  if (!isValidEphemeralSeconds(seconds)) {
+    return res.status(400).json({ error: 'seconds must be one of 0 (off), 86400 (24h), 604800 (7d), 7776000 (90d)' });
+  }
+  try {
+    await withIqTimeout(() => sock.updateDefaultDisappearingMode(seconds));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/presence', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { type, chatId } = req.body;
+  if (!isValidPresenceType(type)) {
+    return res.status(400).json({ error: 'type must be one of available/unavailable/composing/recording/paused' });
+  }
+  try {
+    await withIqTimeout(() => sock.sendPresenceUpdate(type, chatId || undefined));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/profile-picture-url/:jid', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const type = req.query.type === 'image' ? 'image' : 'preview';
+    const url = await withIqTimeout(() => sock.profilePictureUrl(req.params.jid, type));
+    res.json({ success: true, url: url || null });
+  } catch (err) {
+    // Baileys throws when there's no picture set (404 upstream) — that's a
+    // legitimate "no picture" answer, not a bridge/connection failure. A
+    // genuine timeout/connection error also lands here (same as everywhere
+    // else in this file, Baileys doesn't distinguish "not found" from other
+    // IQ failures in the exception shape) — reported as "no picture" is an
+    // acceptable false-negative for a read-only lookup, never a false 200
+    // hang.
+    res.json({ success: true, url: null });
+  }
+});
+
+app.get('/business-profile/:jid', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const profile = await withIqTimeout(() => sock.getBusinessProfile(req.params.jid));
+    res.json({ success: true, profile: profile || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/groups/invite-info/:code', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  try {
+    const metadata = await withIqTimeout(() => sock.groupGetInviteInfo(req.params.code));
+    res.json({ success: true, metadata });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/groups/accept-invite', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const code = String(req.body?.code || '').trim();
+  if (!code) return res.status(400).json({ error: 'code is required' });
+  try {
+    const groupId = await withIqTimeout(() => sock.groupAcceptInvite(code));
+    res.json({ success: true, groupId: groupId || null });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/status-lookup', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { jids } = req.body;
+  if (!Array.isArray(jids) || jids.length === 0) {
+    return res.status(400).json({ error: 'jids (non-empty array) is required' });
+  }
+  try {
+    const results = await withIqTimeout(() => sock.fetchStatus(...jids));
+    res.json({ success: true, results: results || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/ephemeral-lookup', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const { jids } = req.body;
+  if (!Array.isArray(jids) || jids.length === 0) {
+    return res.status(400).json({ error: 'jids (non-empty array) is required' });
+  }
+  try {
+    const results = await withIqTimeout(() => sock.fetchDisappearingDuration(...jids));
+    res.json({ success: true, results: results || [] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/link-previews-privacy', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const payload = buildDisableLinkPreviewsPayload({ disabled: req.body?.disabled });
+  if (!payload) {
+    return res.status(400).json({ error: 'disabled (boolean) is required' });
+  }
+  try {
+    await withIqTimeout(() => sock.chatModify(payload, ''));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/presence-subscribe', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const jid = String(req.body?.jid || '').trim();
+  if (!jid) return res.status(400).json({ error: 'jid is required' });
+  try {
+    await withIqTimeout(() => sock.presenceSubscribe(jid));
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/me', (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+  const id = sock.user?.id || null;
+  const lid = sock.user?.lid || null;
+  res.json({
+    success: true,
+    id,
+    lid,
+    lookupId: id ? normalizeChatJid(id) || null : null,
+    lookupLid: lid ? normalizeChatJid(lid) || null : null,
+    name: sock.user?.name || null,
+    verifiedName: sock.user?.verifiedName || null,
+  });
+});
+
+app.get('/groups', async (req, res) => {
+  if (!sock) return res.status(503).json({ error: 'not_connected' });
+  try {
+    const all = await withIqTimeout(() => sock.groupFetchAllParticipating());
+    const groups = Object.values(all).map(g => ({
+      id: g.id,
+      subject: g.subject,
+      participants: Array.isArray(g.participants) ? g.participants.length : 0,
+    }));
+    res.json({ count: groups.length, groups });
+  } catch (e) {
+    res.status(500).json({ error: String(e && e.message || e) });
+  }
+});
+
 app.get('/chat/:id', async (req, res) => {
   const chatId = req.params.id;
   const isGroup = chatId.endsWith('@g.us');
@@ -1126,6 +1992,9 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    // tokenAuth lets the adapter's _reuse_running_bridge handshake tell a token-enforcing bridge
+    // from a pre-token one, and recycle the latter instead of reusing an unauthenticated bridge.
+    tokenAuth: !!BRIDGE_TOKEN_BUF,
     capabilities: { outboundMentions: true },
   });
 });

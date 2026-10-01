@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Any
 
 from .config import Platform, GatewayConfig, HomeChannel
 from .whatsapp_identity import canonical_whatsapp_identifier
+from gateway.reply_policy import ReplyPolicy
 from gateway.session_identity import transport_profile_of
 from gateway.session_persistence import SessionPersistenceMixin, _DB_UNPINNED
 from gateway.session_recovery import SessionRecoveryMixin
@@ -97,6 +98,24 @@ class SessionSource:
     # over the authenticated relay WebSocket. ``platform`` is the UNDERLYING platform, not
     # ``relay``, so authz must key upstream trust off THIS flag.
     delivered_via_upstream_relay: bool = False
+    # `reply_policy` is stamped once per inbound event by the platform adapter (the
+    # default DM is the safe value for unstamped events and for a partial platform
+    # rollout) and read by the post-turn delivery block to decide whether the tool-gated
+    # delivery inversion applies.
+    #
+    # `reply_gate_tool_sends` counts deliveries to THIS chat via
+    # send_message(target="current"); the post-turn block reads it to dedup the
+    # free-text tail. `reply_gate_decided_silent` is its companion, incremented when the
+    # agent explicitly declares "I decided not to reply" rather than merely producing no
+    # tool call. Together they let the post-turn block distinguish three outcomes —
+    # replied (tool_sends > 0), explicitly silent (decided_silent > 0), or never decided
+    # (both zero) — and only the third is a failure needing a nudge/retry. All three are
+    # wire-INVISIBLE (never in to_dict/from_dict): live-turn state, not routing identity,
+    # so they are also compare=False (like profile_route_rejected): a source must equal its
+    # own to_dict/from_dict round-trip, which drops them.
+    reply_policy: ReplyPolicy = field(default=ReplyPolicy.DM, compare=False)
+    reply_gate_tool_sends: int = field(default=0, compare=False)
+    reply_gate_decided_silent: int = field(default=0, compare=False)
 
     def __post_init__(self) -> None:
         # Mirror scope_id/guild_id onto each other (scope_id wins) so readers of EITHER agree.
@@ -431,6 +450,80 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
     elif src.user_id:
         uid = _hash_sender_id(src.user_id) if redact_pii else src.user_id
         lines.append(f"**User ID:** {_format_untrusted_prompt_value(uid)}")
+
+    # Shared-audience confidentiality guard.
+    #
+    # A non-DM chat (group/channel/thread, or any session flagged as shared
+    # multi-user) is read by EVERY participant, not just the owner. Owner-only
+    # operational detail must never default to such a chat just because the
+    # triggering command happened to arrive there. This block is cache-stable
+    # (no per-turn data) so it does not bust the prompt cache.
+    #
+    # Gated on the audience being multi-person rather than on the per-user
+    # isolation knob: a group with group_sessions_per_user=True still posts
+    # every reply to the shared channel, so the audience is shared regardless.
+    _is_dm = src.chat_type == "dm"
+    _multi_person_audience = (
+        src.platform != Platform.LOCAL
+        and not _is_dm
+        and (
+            context.shared_multi_user_session
+            or src.chat_type in ("group", "channel", "thread")
+            or bool(src.thread_id)
+        )
+    )
+    if _multi_person_audience:
+        lines.append("")
+        lines.append(
+            "**Shared audience — confidentiality:** This chat is read by every "
+            "participant, NOT just the owner. Treat it as a public, non-owner "
+            "audience. Do NOT post owner-private or backend-internal detail here, "
+            "even when an authorized owner command triggered the work. Never "
+            "reveal in this chat: agent/infrastructure internals (config files, "
+            ".env, allowlists, bridges, session/silo/memory mechanics, gateway "
+            "restart/drain behavior, IDs/LIDs, internal tooling), or other "
+            "people's personal data (phone numbers or fragments, the names "
+            "behind those numbers, contact mappings). When an owner asks for an "
+            "administrative/backend action from inside a shared chat, perform it "
+            "and send the detailed operational report to the OWNER's private "
+            "channel (DM / the owner's home channel) — post at most a brief, "
+            "neutral acknowledgement to the shared chat, or nothing. When in "
+            "doubt about whether a detail is owner-private, route it privately."
+        )
+        # A fresh shared-audience session has no transcript yet, so the reply gate
+        # cannot infer an established human-to-human flow. Session creation is not
+        # evidence that the first inbound message addresses the agent. This block is
+        # cache-stable and uses the same shared-audience gate as the confidentiality
+        # contract; DMs and local CLI sessions remain unaffected.
+        lines.append("")
+        lines.append(
+            "**First-message reply gate:** Being handed the first message of a "
+            "new session in this shared chat is NOT evidence that it is "
+            "addressed to you. With no prior conversation to judge against, the "
+            "default is SILENCE unless this specific message clears the Reply "
+            "Gate on its own merits: it explicitly mentions/tags you, asks you "
+            "a direct question, or is a reply to your own message. Ambient "
+            "chatter, greetings, banter, or a message plainly aimed at another "
+            "participant do NOT become yours just because a fresh session "
+            "started on them — stay silent exactly as you would mid-conversation."
+        )
+
+    if src.platform != Platform.LOCAL:
+        # USER PROFILE (USER.md) and long-term memory blocks describe the owner
+        # or other known people, not necessarily whoever is speaking here.
+        # Naming the Current Session Context as authoritative is the positive
+        # half of the non-owner gate: hiding the profile is purely subtractive,
+        # so a reply composed mid owner-report would otherwise still address a
+        # contact as the owner.
+        lines.append("")
+        lines.append(
+            "**Identity safety:** The Current Session Context above is authoritative "
+            "for who is speaking in this chat. Long-term memory/user-profile blocks "
+            "may describe the agent owner or other known people; do NOT treat "
+            "those blocks as the current speaker's identity unless they explicitly "
+            "match this Source/User. Do not address the current speaker as the owner "
+            "unless the Current Session Context says the current User is the owner."
+        )
 
     lines.extend(_PLATFORM_NOTES.get(src.platform, lambda ctx: [])(context))
     platforms_list = ["local (files on this machine)"] + [

@@ -122,6 +122,26 @@ _BILLING_PATTERNS = (
 # marked unverified so surfaces hedge and the pool uses a short cooldown.
 _UNVERIFIED_BILLING_PATTERNS = ("out of extra usage",)
 
+# Anthropic subscription *entitlement* gate, surfaced as HTTP 400. When a Claude
+# Pro/Max subscription must enable extra usage to keep serving, native Anthropic
+# returns a 400 whose body reads like "Third-party apps now draw from your extra
+# usage. To continue, enable extra usage in your account settings." That is a
+# billing/entitlement condition, not a malformed request — without this it fell
+# through to the generic ``format_error`` bucket, so the user got an opaque
+# "format error" instead of actionable billing guidance and no credential
+# rotation fired. Patterns are deliberately specific (an account *action* on
+# extra usage) so they do NOT collide with the 429 rolling-cap / long-context
+# tier gate, which is "extra usage" + "long context" and is classified
+# separately as ``long_context_tier`` on the 429 path. They also stay clear of
+# the #82154 unverified marker (``out of extra usage``): an entitlement action
+# is a verified billing wall, so it maps straight to ``_V_BILLING``.
+_ENTITLEMENT_PATTERNS = (
+    "draw from your extra usage",
+    "enable extra usage",
+    "exceed your extra usage",
+    "extra usage allowance",
+)
+
 # xAI's Grok credit-exhaustion code arrives as HTTP 403, not 402. Provider-
 # scoped on purpose: other providers' billing codes on a 403 stay auth failures.
 _XAI_SPENDING_LIMIT_ERROR_CODE = "personal-team-blocked:spending-limit"
@@ -606,7 +626,12 @@ _404_RULES = (
 # model-not-found / rate-limit / billing as 400 instead of 404/429/402.
 _400_TAIL_RULES = _OVERFLOW_AS_5XX_RULES + (
     (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED), (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),
-    (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT), (_BILLING_PATTERNS, _billing_hints),
+    (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT),
+    # Subscription entitlement gate before the generic billing table: the
+    # entitlement phrasing is a verified account action, so it must not inherit
+    # the #82154 unverified marker that ``out of extra usage`` carries.
+    (_ENTITLEMENT_PATTERNS, _V_BILLING),
+    (_BILLING_PATTERNS, _billing_hints),
 )
 
 # Status-less message path, head (before usage-limit disambiguation).
@@ -618,7 +643,12 @@ _MESSAGE_HEAD_RULES = ((_MEMORY_CEILING_PATTERNS, _V_OVERLOADED),
 # instead of rotating; policy block before model_not_found; timeout/connection
 # wording last, classified as transport (never compression).
 _MESSAGE_TAIL_RULES = (
-    (_OVERLOADED_PATTERNS, _V_OVERLOADED), (_BILLING_PATTERNS, _billing_hints),
+    (_OVERLOADED_PATTERNS, _V_OVERLOADED),
+    # Entitlement gate (status-less variant) before the generic billing table:
+    # same reasoning as the 400 tail above; the 429 long-context twin is already
+    # settled in _provider_special_cases.
+    (_ENTITLEMENT_PATTERNS, _V_BILLING),
+    (_BILLING_PATTERNS, _billing_hints),
     (_RATE_LIMIT_PATTERNS, _V_RATE_LIMIT), (_EMPTY_PROVIDER_RESPONSE_PATTERNS, _V_SERVER_ERROR),
     (_CONTEXT_OVERFLOW_PATTERNS, _V_CONTEXT_OVERFLOW), (_AUTH_PATTERNS, _V_AUTH_ROTATE),
     (_PROVIDER_POLICY_BLOCKED_PATTERNS, _V_POLICY_BLOCKED), (_MODEL_NOT_FOUND_PATTERNS, _V_MODEL_NOT_FOUND),

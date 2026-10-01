@@ -8,6 +8,7 @@ model (multimodal tool-result envelope) or are described by the auxiliary vision
 
 import base64
 import asyncio
+import contextvars
 import json
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
@@ -15,7 +16,7 @@ import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, NamedTuple, Optional
+from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional
 from urllib.parse import urlparse
 import httpx
 
@@ -54,6 +55,92 @@ from tools.vision_tools_image_prep import (
     _validate_raster_image_decodable)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Current-turn inbound-image guard
+# ---------------------------------------------------------------------------
+# Inbound user photos are cached to ``{HERMES_HOME}/cache/images`` (legacy
+# ``image_cache``) as ``img_<hash>.<ext>``. The gateway records the paths it
+# attached for THIS turn here, so the native vision fast path can refuse a
+# cache path that belongs to some OTHER (older) turn.
+#
+# Why this exists: ``[Image attached at: .../image_cache/img_x.jpg]`` hints and
+# raw cache paths leak into durable context via transcript replay AND memory
+# recall. A later turn can then hand ``vision_analyze`` a 12-hour-old cache
+# path; without this guard the fast path silently loads those stale pixels and
+# the model confidently describes the WRONG image (observed 2026-06-17: a fresh
+# "what's this game" photo was answered from an unrelated morning screenshot
+# recalled out of working memory).
+#
+# Default ``None`` means "no gateway turn context" (CLI, tests, subagents) —
+# the guard is INERT and every path resolves as before. An empty list means
+# "this turn attached no inbound images", so ANY cache path is stale. Browser
+# screenshots (``cache/vision``), generated images, and http(s) URLs live
+# outside the inbound cache dir and are never restricted.
+_current_turn_image_paths: contextvars.ContextVar[Optional[List[str]]] = (
+    contextvars.ContextVar("vision_current_turn_image_paths", default=None)
+)
+
+
+def set_current_turn_image_paths(paths: Optional[List[str]]) -> contextvars.Token:
+    """Record the inbound image paths attached on the current gateway turn.
+
+    Pass the list the gateway attached natively (may be empty), or ``None`` to
+    clear. Returns a token; pass it to :func:`reset_current_turn_image_paths`
+    in a ``finally`` so the setting is scoped to exactly one turn.
+    """
+    norm: Optional[List[str]] = None
+    if paths is not None:
+        norm = []
+        for p in paths:
+            try:
+                norm.append(os.path.basename(os.path.realpath(os.path.expanduser(str(p)))))
+            except Exception:
+                continue
+    return _current_turn_image_paths.set(norm)
+
+
+def reset_current_turn_image_paths(token: contextvars.Token) -> None:
+    """Reset the current-turn image-path contextvar using ``token``."""
+    try:
+        _current_turn_image_paths.reset(token)
+    except Exception:
+        pass
+
+
+def _inbound_image_cache_dir() -> Optional[Path]:
+    """Return the resolved inbound-image cache dir, or None if unavailable."""
+    try:
+        from gateway.platforms.base import get_image_cache_dir
+        return get_image_cache_dir().resolve()
+    except Exception:
+        try:
+            return get_hermes_dir("cache/images", "image_cache").resolve()
+        except Exception:
+            return None
+
+
+def _is_stale_inbound_cache_path(resolved_path: Path) -> bool:
+    """True if *resolved_path* is an inbound cache image NOT from this turn.
+
+    Only inbound-image-cache files are policed. A path outside that directory
+    (browser screenshot, generated image, arbitrary local file, downloaded URL)
+    is never considered stale. When there is no gateway turn context (the
+    contextvar is ``None``), nothing is stale — CLI and tests are unaffected.
+    """
+    live = _current_turn_image_paths.get()
+    if live is None:
+        return False  # no gateway turn context — inert
+    cache_dir = _inbound_image_cache_dir()
+    if cache_dir is None:
+        return False
+    try:
+        if resolved_path.parent != cache_dir:
+            return False  # not an inbound-cache image — out of scope
+    except Exception:
+        return False
+    return resolved_path.name not in set(live)
+
 
 _debug = DebugSession("vision_tools", env_var="VISION_TOOLS_DEBUG")
 
@@ -612,6 +699,28 @@ async def _vision_analyze_native(
         from tools.interrupt import is_interrupted
         if is_interrupted():
             return tool_error("Interrupted", success=False)
+        # Refuse an inbound-cache image that belongs to an earlier turn. Stale
+        # cache paths reach us via transcript/memory replay; loading them would
+        # describe the wrong picture. Inert unless the gateway set turn context.
+        try:
+            _stale_check_src = image_url
+            if isinstance(_stale_check_src, str) and _stale_check_src.startswith("file://"):
+                _stale_check_src = _stale_check_src[len("file://"):]
+            if isinstance(_stale_check_src, str) and _stale_check_src and "://" not in _stale_check_src:
+                _stale_check_path = Path(os.path.expanduser(_stale_check_src))
+                if _stale_check_path.is_file() and _is_stale_inbound_cache_path(_stale_check_path.resolve()):
+                    logger.warning(
+                        "vision_analyze refused stale inbound-cache path not from this turn: %s",
+                        _stale_check_path.name,
+                    )
+                    return tool_error(
+                        "That image isn't available anymore — the referenced cache path is "
+                        "from an earlier message, not the current one. Ask the user to resend "
+                        "the image if you need to look at it.",
+                        success=False,
+                    )
+        except Exception:
+            pass
         try:
             prepared = await _prepare_image(image_url, task_id, region, validate_decode=True)
         except _ImagePrepError as exc:

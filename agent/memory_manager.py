@@ -175,6 +175,36 @@ def sanitize_context(text: str) -> str:
     return text
 
 
+# Native image routing appends transport hints like ``[Image attached at:
+# /.../image_cache/img_x.jpg]`` to the current multimodal user turn. Those hints are
+# durable-looking but ephemeral: replayed from the session DB they make a later
+# follow-up look like it still carries the earlier screenshot (upstream #46115).
+_IMAGE_ATTACHMENT_MARKER_RE = re.compile(
+    r'\s*\[Image attached(?: at)?:[^\]\n]+\]',
+    re.IGNORECASE,
+)
+_IMAGE_ATTACHMENT_PLACEHOLDER_RE = re.compile(
+    r'\s*\[(?:screenshot|inline image)\](?=\s|$)',
+    re.IGNORECASE,
+)
+_EXCESS_BLANK_LINES_RE = re.compile(r'\n{3,}')
+
+
+def sanitize_transcript_context(text: str) -> str:
+    """Strip internal context plus ephemeral attachment-routing metadata.
+
+    Wraps :func:`sanitize_context` and additionally removes native image-routing
+    hints so they never persist into transcript replay/recall as durable user text.
+    """
+    cleaned = sanitize_context(text)
+    had_attachment_marker = _IMAGE_ATTACHMENT_MARKER_RE.search(cleaned) is not None
+    cleaned = _IMAGE_ATTACHMENT_MARKER_RE.sub('', cleaned)
+    if had_attachment_marker:
+        cleaned = _IMAGE_ATTACHMENT_PLACEHOLDER_RE.sub('', cleaned)
+        cleaned = _EXCESS_BLANK_LINES_RE.sub('\n\n', cleaned)
+    return cleaned
+
+
 class StreamingContextScrubber:
     """Stateful scrubber for streaming text whose memory-context spans may straddle deltas.
 

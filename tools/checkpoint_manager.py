@@ -60,6 +60,11 @@ DEFAULT_EXCLUDES = [
 ]
 
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
+# A per-project ``<index>.lock`` older than this provably has no living owner:
+# every index-using git invocation in this module is bounded by ``timeout`` (at
+# most ``2 × _GIT_TIMEOUT`` = 120 s), so nothing legitimate can hold a lock for
+# minutes. Used by ``_clear_stale_index_lock``.
+_STALE_INDEX_LOCK_AGE: float = 300.0
 _MAX_FILES = 50_000  # skip huge directories to avoid slowdowns
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')  # short or full SHA-1/SHA-256
 _MB = 1024 * 1024
@@ -237,6 +242,40 @@ def _repair_bare_repo_dirs(store: Path) -> None:
             logger.warning("Cannot create %s in checkpoint store: %s", subdir, exc)
 
 
+def _clear_stale_index_lock(index_file: Optional[Path]) -> None:
+    """Remove an orphaned ``<index>.lock`` left by a killed git process.
+
+    git's index lock protocol has no owner liveness: a git that dies between
+    lock creation and rename (SIGKILL, OOM, machine reset, a parent process
+    tearing down mid-checkpoint) leaves the lock file behind, and every later
+    ``git add -A`` for that project fails with ``Unable to create ...lock:
+    File exists`` — silently killing checkpoints for that project forever.
+
+    Age-gate the removal so a *live* concurrent git is never raced: index-using
+    invocations are bounded by their subprocess timeout (≤ ``2 × _GIT_TIMEOUT``),
+    so a lock older than ``_STALE_INDEX_LOCK_AGE`` has no living owner.
+    """
+    if index_file is None:
+        return
+    lock = index_file.with_name(index_file.name + ".lock")
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except (FileNotFoundError, OSError):
+        return
+    if age < _STALE_INDEX_LOCK_AGE:
+        return
+    try:
+        lock.unlink()
+        logger.warning(
+            "Removed stale checkpoint index lock %s (age %.0fs, no live owner)",
+            lock, age,
+        )
+    except FileNotFoundError:
+        pass  # concurrent cleanup won the race
+    except OSError as exc:
+        logger.error("Could not remove stale index lock %s: %s", lock, exc)
+
+
 def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT_TIMEOUT,
              allowed_returncodes: Optional[Set[int]] = None, index_file: Optional[Path] = None) -> Tuple[bool, str, str]:
     """Run git against the shared store -> (ok, stdout, stderr).  ``allowed_returncodes`` suppresses
@@ -249,6 +288,9 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         logger.error("Git command skipped: %s (%s)", " ".join(cmd), msg)
         return False, "", msg
 
+    # Self-heal before touching the index: an orphaned .lock from a killed
+    # git otherwise fails every write op for this project forever.
+    _clear_stale_index_lock(index_file)
     try:
         result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file), timeout, cwd=str(wd))
     except subprocess.TimeoutExpired:

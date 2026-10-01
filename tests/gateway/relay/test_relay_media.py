@@ -205,20 +205,21 @@ async def test_download_sends_a_user_agent_on_every_request():
         def __exit__(self, *_a):
             return False
 
-    def _fake_urlopen(req, timeout=None):  # noqa: ARG001
+    def _fake_open(self, req, *, authenticated=False):  # noqa: ARG001
         seen.append(dict(req.headers))
         return _Resp()
 
-    import urllib.request as _ur
-
-    orig = _ur.urlopen
-    _ur.urlopen = _fake_urlopen  # type: ignore[assignment]
+    # Patch RelayMediaClient's own fetch seam rather than urllib's global urlopen: the
+    # authenticated path deliberately goes through a private opener that refuses redirects
+    # (so a connector re-host cannot 302 our bearer to an unvalidated host).
+    orig_open = RelayMediaClient._open
+    RelayMediaClient._open = _fake_open  # type: ignore[assignment]
     try:
         c = RelayMediaClient("https://conn.example", "gw1", "sec")
         assert await c.download("https://cdn.discordapp.com/attachments/1/2/v.ogg")
         assert await c.download("https://conn.example/relay/media/deadbeef")
     finally:
-        _ur.urlopen = orig  # type: ignore[assignment]
+        RelayMediaClient._open = orig_open  # type: ignore[assignment]
 
     assert len(seen) == 2
     for headers in seen:
@@ -236,7 +237,9 @@ def test_is_relay_media_url_distinguishes_rehost_from_public():
     public URLs (CDN pass-throughs) do not. None/empty never raise."""
     c = RelayMediaClient("https://conn.example", "gw1", "sec")
     assert c.is_relay_media_url("https://conn.example/relay/media/aa11") is True
-    assert c.is_relay_media_url("http://other.host:8080/relay/media/x") is True
+    # A FOREIGN host is refused: presenting our scoped bearer to it would disclose the
+    # credential (a crafted media_url in an inbound event could pick the host).
+    assert c.is_relay_media_url("http://other.host:8080/relay/media/x") is False
     assert c.is_relay_media_url("https://cdn.discordapp.com/attachments/1/2/v.ogg") is False
     assert c.is_relay_media_url("https://conn.example/relay/mediafile") is False
     assert c.is_relay_media_url("") is False

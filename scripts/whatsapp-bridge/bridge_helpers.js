@@ -1,6 +1,60 @@
 import path from 'path';
-import { mkdirSync, writeFileSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { mkdirSync, writeFileSync, readFileSync } from 'fs';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
+
+/**
+ * Constant-time capability-token check for the bridge's loopback HTTP endpoints.
+ * `tokenBuf` is the configured token as a Buffer (or null when no token is set).
+ * Returns true when no token is configured (back-compat), or when `presented`
+ * matches `tokenBuf` in constant time. Length mismatch bails before
+ * timingSafeEqual (which throws on unequal lengths); any throw is treated as a
+ * non-match, never an accept.
+ */
+export function bridgeTokenOk(tokenBuf, presented) {
+  if (!tokenBuf) return true;
+  const got = Buffer.from(String(presented || ''));
+  if (got.length !== tokenBuf.length) return false;
+  try {
+    return timingSafeEqual(got, tokenBuf);
+  } catch {
+    return false;
+  }
+}
+
+
+// Bridge source files whose integrity the running process advertises via the
+// /health `scriptHash`. Hashing bridge.js alone let a helper-module edit slip
+// past the reuse check, so a stale process kept serving old helper code after a
+// redeploy. The Python side (_bridge_source_hash) replicates this byte-for-byte.
+export const BRIDGE_SOURCE_FILES = [
+  'allowlist.js',
+  'bridge.js',
+  'bridge_helpers.js',
+  'outbound_ids.js',
+  'owner_message_gate.js',
+];
+
+/**
+ * Deterministic 16-hex-char digest over the given source files in `dir`.
+ * Sorts names, feeds `name\0bytes\0` per file, skips missing files. MUST match
+ * gateway/plugins/platforms/whatsapp/adapter.py:_bridge_source_hash exactly.
+ */
+export function bridgeSourceHash(dir, files = BRIDGE_SOURCE_FILES) {
+  const h = createHash('sha256');
+  for (const name of [...files].sort()) {
+    let data;
+    try {
+      data = readFileSync(path.join(dir, name));
+    } catch {
+      continue;
+    }
+    h.update(Buffer.from(name, 'utf8'));
+    h.update(Buffer.from([0]));
+    h.update(data);
+    h.update(Buffer.from([0]));
+  }
+  return h.digest('hex').slice(0, 16);
+}
 
 export const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
@@ -60,29 +114,97 @@ export function getContextInfo(messageContent) {
   return {};
 }
 
-export function createBoundedMessageStore(limit = 512) {
+export function createBoundedMessageStore(limit = 512, { ttlMs = 0 } = {}) {
+  // id -> { msg, seenAt }. Insertion order doubles as the LRU order.
   const byId = new Map();
 
-  function remember(msg) {
-    const id = msg?.key?.id;
-    if (!id) return;
-    byId.delete(id);
-    byId.set(id, msg);
+  function expired(entry, now) {
+    return ttlMs > 0 && now - entry.seenAt > ttlMs;
+  }
+
+  function evict(now) {
+    if (ttlMs > 0) {
+      for (const [id, entry] of byId) {
+        if (expired(entry, now)) byId.delete(id);
+      }
+    }
     while (byId.size > limit) {
       const oldest = byId.keys().next().value;
       byId.delete(oldest);
     }
   }
 
-  function get(id) {
-    if (!id || !byId.has(id)) return null;
-    const msg = byId.get(id);
+  function remember(msg, seenAt = Date.now()) {
+    const id = msg?.key?.id;
+    if (!id) return;
     byId.delete(id);
-    byId.set(id, msg);
-    return msg;
+    byId.set(id, { msg, seenAt });
+    evict(seenAt);
   }
 
-  return { remember, get };
+  function get(id) {
+    // LRU touch: refreshes the entry's position (NOT its seenAt). Use peek()
+    // for read-only resolution where recency order must stay untouched.
+    if (!id || !byId.has(id)) return null;
+    const entry = byId.get(id);
+    if (expired(entry, Date.now())) {
+      byId.delete(id);
+      return null;
+    }
+    byId.delete(id);
+    byId.set(id, entry);
+    return entry.msg;
+  }
+
+  function peek(id, now = Date.now()) {
+    // Non-mutating lookup; expired entries are dropped, live ones untouched.
+    if (!id || !byId.has(id)) return null;
+    const entry = byId.get(id);
+    if (expired(entry, now)) {
+      byId.delete(id);
+      return null;
+    }
+    return entry.msg;
+  }
+
+  function latestForChat(chatId) {
+    if (!chatId) return null;
+    // Map preserves insertion order; walk newest-first for the most recent
+    // remembered message in this chat (used to react without an explicit id).
+    const entries = Array.from(byId.values());
+    for (let i = entries.length - 1; i >= 0; i -= 1) {
+      if (entries[i]?.msg?.key?.remoteJid === chatId) return entries[i].msg;
+    }
+    return null;
+  }
+
+  function latestInboundForChat(chatId, { now = Date.now(), normalize = normalizeChatJid } = {}) {
+    // Most recent RECEIVED message for the chat by seenAt (not LRU position —
+    // get()'s touch would otherwise shuffle stale poll lookups to "latest").
+    // Outbound (fromMe) and expired entries are skipped.
+    const target = normalize(chatId || '');
+    if (!target) return null;
+    let latest = null;
+    for (const entry of byId.values()) {
+      if (expired(entry, now)) continue;
+      if (entry.msg?.key?.fromMe) continue;
+      if (normalize(entry.msg?.key?.remoteJid || '') !== target) continue;
+      if (!latest || entry.seenAt >= latest.seenAt) latest = entry;
+    }
+    return latest ? latest.msg : null;
+  }
+
+  return {
+    remember,
+    get,
+    peek,
+    latestForChat,
+    latestInboundForChat,
+    clear: () => byId.clear(),
+    get size() {
+      return byId.size;
+    },
+  };
 }
 
 /**
@@ -587,11 +709,72 @@ export async function extractBridgeEvent({
     readReceiptKey: {
       remoteJid: msg.key.remoteJid || chatId,
       id: msg.key.id,
-      participant: msg.key.participant || senderId,
+      // Groups only: a participant on a DM receipt key makes WhatsApp drop it.
+      ...(isGroup ? { participant: msg.key.participant || senderId } : {}),
       fromMe: Boolean(msg.key.fromMe),
     },
     timestamp: msg.messageTimestamp,
   };
+}
+
+/** HTTP statuses that mean "this media URL is dead, ask WhatsApp to re-upload".
+ *
+ * Baileys' own retry set is [410, 404], but WhatsApp's CDN answers an expired
+ * `oe=` deadline with **403** — verified live against a real expired sticker
+ * URL from bridge.log. Without 403 the recovery path is unreachable for the
+ * most common expiry case.
+ */
+const REUPLOAD_RECOVERABLE_STATUS = new Set([403, 404, 410]);
+
+/** Extract an HTTP status from an error, wherever the thrower put it.
+ *
+ * @hapi/boom (what Baileys throws) exposes the code at `output.statusCode`;
+ * `error.status` is undefined. Baileys' internal recovery only reads
+ * `error.status`, which is why its reupload path never fires in practice.
+ */
+export function httpStatusFromError(err) {
+  const candidates = [
+    err?.status,
+    err?.statusCode,
+    err?.output?.statusCode,
+    err?.output?.payload?.statusCode,
+  ];
+  for (const value of candidates) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+  }
+  return null;
+}
+
+/**
+ * Download inbound media, recovering from an expired CDN URL.
+ *
+ * WhatsApp media URLs carry an `oe=` expiry; once past it the CDN returns 403
+ * and the bytes are only retrievable by asking WhatsApp to re-upload the
+ * message (`sock.updateMediaMessage`). Baileys ships that recovery but gates
+ * it on `error.status` ∈ {410, 404} — a field @hapi/boom never sets, for a
+ * status the CDN never returns. Both halves miss, so every expired attachment
+ * degraded to "[sticker could not be downloaded]".
+ *
+ * We retry exactly once: request the re-upload, then re-attempt the download.
+ * A second failure, or any non-HTTP error (bad decrypt, disk full), propagates
+ * to the caller unchanged — re-uploading cannot fix those and looping would
+ * hammer the socket.
+ */
+export async function downloadMediaWithRecovery({ msg, download, reuploadRequest }) {
+  try {
+    return await download(msg);
+  } catch (err) {
+    const status = httpStatusFromError(err);
+    if (
+      typeof reuploadRequest !== 'function'
+      || status === null
+      || !REUPLOAD_RECOVERABLE_STATUS.has(status)
+    ) {
+      throw err;
+    }
+    const refreshed = await reuploadRequest(msg);
+    return await download(refreshed || msg);
+  }
 }
 
 export function inferMediaType(ext) {
@@ -604,7 +787,12 @@ export function inferMediaType(ext) {
 export function inboundReadReceiptKeys({ key, enabled }) {
   if (!enabled || !key || key.fromMe || !key.id || !key.remoteJid) return [];
   // Preserve participant for group messages: Baileys needs the original key.
-  return [key];
+  if (key.remoteJid.endsWith('@g.us')) return [key];
+  // A DM key must not carry participant. Baileys' sendReceipt copies it onto the
+  // <receipt> node, which then looks group-shaped and WhatsApp drops it: no blue
+  // ticks, yet readMessages() resolves and /read reports marked:true.
+  const { participant: _participant, ...dmKey } = key;
+  return [dmKey];
 }
 
 export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, fileName }) {
@@ -621,6 +809,10 @@ export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, file
       return { image: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'image/jpeg' };
     case 'video':
       return { video: buffer, caption: caption || undefined, mimetype: MIME_MAP[ext] || 'video/mp4' };
+    case 'sticker':
+      // Explicit [[as_sticker]] directive: raw bytes as a WhatsApp sticker.
+      // Stickers carry no caption bubble.
+      return { sticker: buffer };
     case 'document':
       return {
         document: buffer,
@@ -724,4 +916,341 @@ export function createVersionResolver(fetchVersionFn, {
     }
     return cachedVersion;
   };
+}
+
+// ── Restored WhatsApp native surface helpers (ported from live ref 828ce02edf) ──
+
+/**
+ * Normalize a JID for *chat identity* comparison.
+ *
+ * Distinct from ``normalizeWhatsAppId`` (which rewrites ``:`` to ``@`` for id
+ * display): this strips the device/agent suffix so ``1555:12@s.whatsapp.net``
+ * and ``1555@s.whatsapp.net`` are recognized as the same conversation.
+ *
+ * The server domain is deliberately PRESERVED. ``@lid`` is a separate address
+ * space from ``@s.whatsapp.net`` — the numeric part of a LID is not a phone
+ * number — so the two must never compare equal, or a quote from one chat could
+ * be attached to a send in another.
+ */
+export function normalizeChatJid(value) {
+  if (!value) return '';
+  const raw = String(value).trim().toLowerCase();
+  if (!raw) return '';
+  const at = raw.lastIndexOf('@');
+  if (at === -1) return raw.split(':')[0];
+  const user = raw.slice(0, at).split(':')[0];
+  const server = raw.slice(at + 1);
+  if (!user || !server) return '';
+  return `${user}@${server}`;
+}
+
+/**
+ * Resolve who a cached status/story belongs to. A status message's own key
+ * carries the author as `participant` (group-style addressing even though
+ * status@broadcast isn't a group); `statusAuthorJid` from the caller is an
+ * explicit override for when the cache lacks participant metadata (e.g. the
+ * status was seen before the bridge process restarted and repopulated from a
+ * fresh upsert that happened to omit it).
+ */
+export function getStatusAuthor(statusMsg, fallback) {
+  return normalizeWhatsAppId(
+    fallback || statusMsg?.key?.participant || statusMsg?.participant || ''
+  );
+}
+
+/**
+ * Build the WAMessageKey `sendMessage(jid, { delete: key })` needs to delete
+ * a message for everyone. `fromMe` must be explicit and boolean — deleting
+ * someone else's message in a group requires admin rights server-side and a
+ * wrong `fromMe` silently no-ops rather than erroring, so this refuses to
+ * guess.
+ */
+
+/**
+ * Build the WAMessageKey `sendMessage(jid, { delete: key })` needs to delete
+ * a message for everyone. `fromMe` must be explicit and boolean — deleting
+ * someone else's message in a group requires admin rights server-side and a
+ * wrong `fromMe` silently no-ops rather than erroring, so this refuses to
+ * guess.
+ */
+export function buildDeleteKey({ chatId, messageId, fromMe, participant }) {
+  if (!chatId || !messageId || typeof fromMe !== 'boolean') return null;
+  const key = { remoteJid: chatId, id: messageId, fromMe };
+  if (participant) key.participant = participant;
+  return key;
+}
+
+/**
+ * Build the `chatModify({ star: {...} }, jid)` payload. `messages` is a list
+ * of `{id, fromMe}` — WhatsApp's star primitive is keyed on message
+ * ownership, not just id, same reasoning as buildDeleteKey.
+ */
+
+/**
+ * Build the `chatModify({ star: {...} }, jid)` payload. `messages` is a list
+ * of `{id, fromMe}` — WhatsApp's star primitive is keyed on message
+ * ownership, not just id, same reasoning as buildDeleteKey.
+ */
+export function buildStarPayload({ messages, star }) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const clean = messages
+    .filter((m) => m && m.id && typeof m.fromMe === 'boolean')
+    .map((m) => ({ id: String(m.id), fromMe: m.fromMe }));
+  if (clean.length === 0) return null;
+  return { star: { messages: clean, star: Boolean(star) } };
+}
+
+/** `chatModify({ archive, lastMessages }, jid)` — archive/unarchive a chat. */
+
+/** `chatModify({ archive, lastMessages }, jid)` — archive/unarchive a chat. */
+export function buildArchivePayload({ archive, lastMessage }) {
+  if (typeof archive !== 'boolean' || !lastMessage?.key) return null;
+  return { archive, lastMessages: [lastMessage] };
+}
+
+/**
+ * `chatModify({ mute }, jid)` — mute for a duration in ms, or `null` to
+ * unmute. WhatsApp only accepts a small set of durations (8h/7d) server-side
+ * but passes through whatever we send; validation of the exact allowed set
+ * is left to WhatsApp's own response rather than duplicated here.
+ */
+
+/**
+ * `chatModify({ mute }, jid)` — mute for a duration in ms, or `null` to
+ * unmute. WhatsApp only accepts a small set of durations (8h/7d) server-side
+ * but passes through whatever we send; validation of the exact allowed set
+ * is left to WhatsApp's own response rather than duplicated here.
+ */
+export function buildMutePayload({ muteMs }) {
+  if (muteMs !== null && (!Number.isFinite(muteMs) || muteMs <= 0)) return null;
+  return { mute: muteMs };
+}
+
+/** `chatModify({ pin }, jid)` — pin/unpin a chat. */
+
+/** `chatModify({ pin }, jid)` — pin/unpin a chat. */
+export function buildPinPayload({ pin }) {
+  if (typeof pin !== 'boolean') return null;
+  return { pin };
+}
+
+/** `chatModify({ markRead, lastMessages }, jid)` — mark a chat read/unread. */
+
+/** `chatModify({ markRead, lastMessages }, jid)` — mark a chat read/unread. */
+export function buildMarkReadPayload({ read, lastMessage }) {
+  if (typeof read !== 'boolean' || !lastMessage?.key) return null;
+  return { markRead: read, lastMessages: [lastMessage] };
+}
+
+const _GROUP_SETTINGS = new Set(['announcement', 'not_announcement', 'locked', 'unlocked']);
+
+/** Validate a `groupSettingUpdate` tag against the set Baileys/WA accept. */
+
+/** Validate a `groupSettingUpdate` tag against the set Baileys/WA accept. */
+export function isValidGroupSetting(setting) {
+  return _GROUP_SETTINGS.has(String(setting || ''));
+}
+
+const _GROUP_PARTICIPANT_ACTIONS = new Set(['add', 'remove', 'promote', 'demote']);
+
+/** Validate a `groupParticipantsUpdate` action. */
+
+/** Validate a `groupParticipantsUpdate` action. */
+export function isValidGroupParticipantAction(action) {
+  return _GROUP_PARTICIPANT_ACTIONS.has(String(action || ''));
+}
+
+/**
+ * Normalize a phone number for `onWhatsApp` existence checks. Accepts a bare
+ * E.164-ish number ("+52155...", "52155...") or an already-built JID and
+ * returns the bare-number JID `onWhatsApp` expects — it does its own
+ * `+`-stripping internally but rejects LIDs outright, so normalizing here
+ * keeps the HTTP layer from ever forwarding a `@lid` into a call that will
+ * silently skip it (Baileys logs a warning and returns nothing for that
+ * entry, which reads as "not on WhatsApp" if the caller isn't watching for
+ * it).
+ */
+
+/**
+ * Normalize a phone number for `onWhatsApp` existence checks. Accepts a bare
+ * E.164-ish number ("+52155...", "52155...") or an already-built JID and
+ * returns the bare-number JID `onWhatsApp` expects — it does its own
+ * `+`-stripping internally but rejects LIDs outright, so normalizing here
+ * keeps the HTTP layer from ever forwarding a `@lid` into a call that will
+ * silently skip it (Baileys logs a warning and returns nothing for that
+ * entry, which reads as "not on WhatsApp" if the caller isn't watching for
+ * it).
+ */
+export function normalizePhoneForCheck(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (raw.endsWith('@lid')) return null;
+  const digits = raw.includes('@') ? raw.split('@')[0].split(':')[0] : raw.replace(/[^\d]/g, '');
+  if (!digits) return null;
+  return `${digits}@s.whatsapp.net`;
+}
+
+// --- Capability-audit tier 2 (2026-08-11): privacy, blocklist, contacts,
+// group-join-approval, ephemeral messages, presence. Same pure-builder
+// pattern as tier 1 — every payload validated/shaped here, wired in
+// bridge.js only as thin sock.* passthroughs.
+
+const _PRIVACY_CATEGORIES = {
+  // category -> {sockMethod, allowedValues}. messages/calladd/groupadd have
+  // a narrower value set than the rest (no 'none' — WhatsApp doesn't offer
+  // "nobody can message me" as a privacy category, only block does that).
+  last: { values: ['all', 'contacts', 'contact_blacklist', 'none'] },
+  online: { values: ['all', 'match_last_seen'] },
+  profile: { values: ['all', 'contacts', 'contact_blacklist', 'none'] },
+  status: { values: ['all', 'contacts', 'contact_blacklist', 'none'] },
+  readreceipts: { values: ['all', 'none'] },
+  groupadd: { values: ['all', 'contacts', 'contact_blacklist'] },
+  calladd: { values: ['all', 'known'] },
+  messages: { values: ['all', 'contacts'] },
+};
+
+/** Validate a privacy category + value pair against WhatsApp's real enums. */
+
+/** Validate a privacy category + value pair against WhatsApp's real enums. */
+export function isValidPrivacyUpdate(category, value) {
+  const spec = _PRIVACY_CATEGORIES[String(category || '')];
+  if (!spec) return false;
+  return spec.values.includes(String(value || ''));
+}
+
+/** Map a privacy category name to the exact `sock.update*Privacy` method. */
+
+/** Map a privacy category name to the exact `sock.update*Privacy` method. */
+export function privacySockMethodName(category) {
+  const map = {
+    last: 'updateLastSeenPrivacy',
+    online: 'updateOnlinePrivacy',
+    profile: 'updateProfilePicturePrivacy',
+    status: 'updateStatusPrivacy',
+    readreceipts: 'updateReadReceiptsPrivacy',
+    groupadd: 'updateGroupsAddPrivacy',
+    calladd: 'updateCallPrivacy',
+    messages: 'updateMessagesPrivacy',
+  };
+  return map[String(category || '')] || null;
+}
+
+const _BLOCK_ACTIONS = new Set(['block', 'unblock']);
+
+/** Validate a block/unblock action. */
+
+/** Validate a block/unblock action. */
+export function isValidBlockAction(action) {
+  return _BLOCK_ACTIONS.has(String(action || ''));
+}
+
+/**
+ * Build the `chatModify({ contact }, jid)` payload for addOrEditContact, or
+ * `{ contact: null }` for removeContact. A contact needs at least a name to
+ * be worth saving — an empty add is a caller bug, not a valid "clear" (use
+ * remove=true for that).
+ */
+
+/**
+ * Build the `chatModify({ contact }, jid)` payload for addOrEditContact, or
+ * `{ contact: null }` for removeContact. A contact needs at least a name to
+ * be worth saving — an empty add is a caller bug, not a valid "clear" (use
+ * remove=true for that).
+ */
+export function buildContactPayload({ name, remove }) {
+  if (remove) return { contact: null };
+  const trimmed = String(name || '').trim();
+  if (!trimmed) return null;
+  return { contact: { name: trimmed } };
+}
+
+const _EPHEMERAL_SECONDS = new Set([0, 86400, 604800, 7776000]);
+
+/** Validate a disappearing-messages duration against WhatsApp's allowed set. */
+
+/** Validate a disappearing-messages duration against WhatsApp's allowed set. */
+export function isValidEphemeralSeconds(seconds) {
+  return _EPHEMERAL_SECONDS.has(Number(seconds));
+}
+
+const _JOIN_APPROVAL_MODES = new Set(['on', 'off']);
+
+/** Validate a group join-approval mode. */
+
+/** Validate a group join-approval mode. */
+export function isValidJoinApprovalMode(mode) {
+  return _JOIN_APPROVAL_MODES.has(String(mode || ''));
+}
+
+const _MEMBER_ADD_MODES = new Set(['all_member_add', 'admin_add']);
+
+/** Validate a group member-add mode. */
+
+/** Validate a group member-add mode. */
+export function isValidMemberAddMode(mode) {
+  return _MEMBER_ADD_MODES.has(String(mode || ''));
+}
+
+const _JOIN_REQUEST_ACTIONS = new Set(['approve', 'reject']);
+
+/** Validate a group join-request approve/reject action. */
+
+/** Validate a group join-request approve/reject action. */
+export function isValidJoinRequestAction(action) {
+  return _JOIN_REQUEST_ACTIONS.has(String(action || ''));
+}
+
+const _PRESENCE_TYPES = new Set(['available', 'unavailable', 'composing', 'recording', 'paused']);
+
+/** Validate a presence-update type. `chatId` is required for the four
+ * per-chat types (composing/recording/paused need one to mean anything;
+ * `available`/`unavailable` are account-wide but Baileys still accepts an
+ * optional target). */
+
+/** Validate a presence-update type. `chatId` is required for the four
+ * per-chat types (composing/recording/paused need one to mean anything;
+ * `available`/`unavailable` are account-wide but Baileys still accepts an
+ * optional target). */
+export function isValidPresenceType(type) {
+  return _PRESENCE_TYPES.has(String(type || ''));
+}
+
+// --- Capability-audit tier 4 (2026-08-11, fourth pass): link-preview
+// privacy chatModify wrapper. presenceSubscribe needs no builder — it's a
+// single-argument passthrough (subscribe to a JID's presence updates so
+// Baileys starts pushing them over the socket) validated by JID-shape alone.
+
+/** `chatModify({ disableLinkPreviews }, '')` — global (not per-chat) toggle. */
+
+/** `chatModify({ disableLinkPreviews }, '')` — global (not per-chat) toggle. */
+export function buildDisableLinkPreviewsPayload({ disabled }) {
+  if (typeof disabled !== 'boolean') return null;
+  return { disableLinkPreviews: { isPreviewsDisabled: disabled } };
+}
+
+/**
+ * Force outbound text through a link-preview policy.
+ *
+ * Baileys generates link previews by fetching the URL in the message text. That
+ * is an outbound network request driven by message *content*, and it happens
+ * inside sendMessage — after any caller-side scope check has already passed — so
+ * a scoped send could still reach a URL the scope should not touch. This marks
+ * every plain text send as preview-free (`linkPreview: null`) unless the caller
+ * has already supplied a preview object, in which case the content is passed
+ * through untouched.
+ *
+ * Two invariants the tests pin, both easy to regress:
+ *   * `linkPreview: null` is explicit — leaving the field undefined lets Baileys
+ *     generate the preview, which is the behaviour being prevented.
+ *   * the caller's own content object is never mutated; the policy builds a copy.
+ */
+export function installOutboundTextPolicy(socket) {
+  const send = socket.sendMessage.bind(socket);
+  socket.sendMessage = (jid, content, options) => send(
+    jid,
+    typeof content?.text === 'string' && content.linkPreview === undefined
+      ? { ...content, linkPreview: null }
+      : content,
+    options,
+  );
 }

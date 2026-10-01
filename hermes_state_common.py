@@ -93,8 +93,11 @@ def _sql_after_marker(marker: str) -> str:
 
 
 # Match the whole introduction shared by current and legacy prefixes, so a message that merely starts with the
-# bracketed label is not a compaction carrier.
-_PREVIEW_LONG_FORM_PREFIX = SUMMARY_PREFIX.split("Do NOT answer", 1)[0]
+# bracketed label is not a compaction carrier. Cut at a sentence EVERY generation carries (current and every
+# _HISTORICAL_SUMMARY_PREFIXES entry): a cut keyed to later wording ("Do NOT answer") silently becomes the WHOLE
+# prefix when the wording is revised, and then no older transcript's carrier matches (the preview leaks the handoff).
+_PREVIEW_SHARED_INTRO_END = "This is a handoff from a previous context window"
+_PREVIEW_LONG_FORM_PREFIX = SUMMARY_PREFIX.split(_PREVIEW_SHARED_INTRO_END, 1)[0] + _PREVIEW_SHARED_INTRO_END
 _PREVIEW_SUMMARY_PREFIXES = (_PREVIEW_LONG_FORM_PREFIX, LEGACY_SUMMARY_PREFIX)
 _PREVIEW_STANDALONE_SUMMARY_SQL = _sql_starts_with("m.content", _PREVIEW_SUMMARY_PREFIXES)
 _PREVIEW_MERGED_AFTER_SQL = _sql_after_marker(_MERGED_SUMMARY_DELIMITER)
@@ -453,6 +456,15 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+-- Sender-scoped model defaults contain no credentials and are independent of session routing.
+CREATE TABLE IF NOT EXISTS gateway_sender_model_preferences (
+    platform TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    PRIMARY KEY (platform, sender_id)
 );
 
 CREATE TABLE IF NOT EXISTS gateway_routing (

@@ -5,7 +5,8 @@ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their 
 """
 
 import codecs
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 import json
 import logging
 import os
@@ -152,11 +153,19 @@ def _worker_memory_max_bytes() -> int:
 def _systemd_scope_argv(binary: str, unit_name: str, *argv: str) -> List[str]:
     """``systemd-run --user --scope`` argv shared by the probe and real spawns.
     ``--collect`` self-cleans the scope after exit; ``--unit`` names it for systemctl.
-    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486)."""
+    No ``OOMPolicy=``: transient scopes reject it on systemd <253 (#102486).
+
+    ``MemorySwapMax=0`` is what makes ``MemoryMax`` bite promptly. With swap available a
+    worker that overruns its budget does not die: the kernel prefers direct-reclaim
+    thrashing, which froze the gateway's event loop for 20 minutes while every health
+    check still reported the unit active. A worker over budget must die alone and fast,
+    not grind the host through swap first.
+    """
     return [
         binary, "--user", "--scope", "--quiet", "--unit", unit_name, "--collect",
         "--property", "MemoryAccounting=yes",
         "--property", f"MemoryMax={_worker_memory_max_bytes()}",
+        "--property", "MemorySwapMax=0",
         "--", *argv,
     ]
 
@@ -501,6 +510,129 @@ def _completion_output(session: "ProcessSession") -> dict:
     return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# Process-ownership isolation: every model-facing process action is scoped to
+# the OBJECT OWNER captured at spawn, never to a model-supplied key/id/profile.
+# ──────────────────────────────────────────────────────────────────────────
+
+_model_process_access: ContextVar[bool] = ContextVar("model_process_access", default=False)
+
+
+@contextmanager
+def model_process_scope():
+    """Apply the same ownership boundary to every model-facing process tool."""
+    token = _model_process_access.set(True)
+    try:
+        yield
+    finally:
+        _model_process_access.reset(token)
+
+
+def _process_owner_context() -> dict:
+    """Snapshot trusted origin; never borrow a sibling's environment in a host.
+
+    get_session_env's legacy fallback is intentionally not used after the
+    session-context machinery engages (or in a gateway with a lost context).
+    This is the same distinction made by the subprocess environment bridge.
+    """
+    from gateway import session_context as sc
+
+    scope = sc.get_execution_scope()
+    multiplexed = (
+        sc.session_context_engaged()
+        or scope is sc.SessionExecutionScope.SESSION
+        or bool(os.getenv("_HERMES_GATEWAY") or os.getenv("HERMES_GATEWAY_SESSION"))
+    )
+    bound = sc.bound_session_snapshot()
+    origin: dict = {"version": 1, "execution_principal": bound["execution_principal"]}
+    for field_name in ("KEY", "ID", "PROFILE", "SOURCE", "PLATFORM", "CHAT_ID"):
+        name = f"HERMES_SESSION_{field_name}"
+        value = bound.get(name, "" if multiplexed else os.getenv(name, ""))
+        origin[field_name.lower()] = str(value or "")
+    origin["home"] = str(get_hermes_home())
+    origin["multiplexed"] = multiplexed
+    origin["local_cli"] = scope is sc.SessionExecutionScope.LOCAL_CLI
+    return origin
+
+
+def _process_access_allowed(session: "ProcessSession") -> bool:
+    """The single object-ownership evaluator for every model process action.
+
+    Container/task keys (including 'default', profile containers, bg_* and sa-*)
+    are not principals. Background/delegated work inherits its conversation's
+    origin. Unknown/missing gateway origin fails closed; direct CLI retains
+    same-profile administrative access. No model arguments participate here.
+    """
+    if not _model_process_access.get():
+        return True
+    try:
+        from tools.approval import get_current_message_source
+
+        current = _process_owner_context()
+        owner = session.owner_context
+        # Even local administration needs positive same-profile provenance.
+        # Legacy restored handles remain available to trusted internal cleanup,
+        # but an absent owner must never inherit the recovering caller.
+        if (not isinstance(owner, dict) or type(owner.get("version")) is not int
+                or owner["version"] != 1
+                or any(owner.get(k) != current[k] for k in ("home", "profile"))):
+            return False
+        source = get_current_message_source()
+        principal = current["execution_principal"]
+        if principal:
+            return bool(source is None and owner.get("execution_principal") == principal)
+        # Classic cmd_chat binds a typed local scope for its whole lifetime,
+        # independent of --source and of a cron worker engaging the host latch.
+        # Keep the existing explicitly bound CLI and fresh standalone contracts.
+        cli = (
+            (current["local_cli"] or current["source"] == "cli")
+            and not current["platform"]
+            and not os.getenv("_HERMES_GATEWAY")
+            and not os.getenv("HERMES_GATEWAY_SESSION")
+        )
+        standalone = (
+            not current["multiplexed"]
+            and not current["platform"] and not os.getenv("HERMES_PLATFORM")
+        )
+        if source is None and (cli or standalone):
+            return True
+        if owner.get("execution_principal"):
+            return False  # a non-chat run never falls back to a task/container key
+        if not current["key"]:
+            return False
+        if any(owner.get(k) != current[k] for k in ("platform", "source")):
+            return False
+        if source is not None:
+            platform = getattr(source, "platform", None)
+            platform = getattr(platform, "value", platform)
+            if str(platform or "") != current["platform"]:
+                return False
+            # Check consistency of THIS turn's trusted bindings, not the old
+            # watcher return address. Phone/LID aliases can change that address
+            # without changing the canonical conversation owner.
+            if str(getattr(source, "chat_id", "") or "") != current["chat_id"]:
+                return False
+        return bool(session.session_key and session.session_key == current["key"])
+    except Exception:
+        # Import/context/metadata failures cannot grant access or expose details.
+        return False
+
+
+def current_process_ui_scope() -> tuple[str, str]:
+    """Positive, bound-only UI return address for a tab whose process was pruned."""
+    from gateway.session_context import bound_session_snapshot
+    from tools.approval import get_current_message_source
+
+    bound = bound_session_snapshot()
+    key = bound.get("HERMES_SESSION_KEY", "")
+    ui = bound.get("HERMES_UI_SESSION_ID", "")
+    if (key and ui and bound.get("HERMES_SESSION_SOURCE") in {"desktop", "tui"}
+            and not bound.get("HERMES_SESSION_PLATFORM")
+            and get_current_message_source() is None):
+        return key, ui
+    return "", ""
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -511,6 +643,10 @@ class ProcessSession:
     owner_task_id: str = ""                     # RAW spawning task id ("sa-..."); ownership
                                                 # checks must use this, not task_id
     session_key: str = ""                       # Gateway session key (reset protection)
+    # Ownership snapshot taken at CONSTRUCTION (never from model arguments): the
+    # single input to _process_access_allowed. kw_only so it can sit beside the
+    # other defaults without disturbing positional callers.
+    owner_context: dict = field(default_factory=_process_owner_context, kw_only=True)
     pid: Optional[int] = None
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Environment object (sandbox spawns)
@@ -639,6 +775,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # Driver-installed sinks (desktop gateway): on_output(session, chunk) streams
         # live output from reader threads; on_close(session_or_none, process_id) drops
         # a read-only terminal tab without killing the process.
+        self.on_output: Optional[Any] = None
+        self.on_close: Optional[Any] = None
         self.on_output = None
         self.on_close = None
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -1861,8 +1999,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
         if session is None:
-            session = load_completed_results(session_id).get(session_id)
-        return self._refresh_detached_session(session if session is not None else self._resolve_prefix(session_id))
+            session = self._resolve_prefix(session_id)
+        # The single ownership gate, applied to the RESOLVED session so that the
+        # exact id, a prefix, and the short form are all scoped by this one line
+        # rather than at each call site. A handle the caller does not own answers
+        # exactly as an unknown id does.
+        # It runs BEFORE the detached refresh and BEFORE a durable-receipt load:
+        # a denied query must not probe a foreign PID, consume its completion
+        # event, or even be handed the retained receipt for it.
+        if session is not None and not _process_access_allowed(session):
+            return None
+        if session is None:
+            recovered = load_completed_results(session_id).get(session_id)
+            if recovered is not None and not _process_access_allowed(recovered):
+                return None
+            session = recovered
+        return self._refresh_detached_session(session)
 
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to
@@ -1874,11 +2026,18 @@ class ProcessRegistry(ProcessCheckpointMixin):
             query = f"proc_{query}"
         if len(query) - len("proc_") < self._MIN_PREFIX_CHARS:
             return None
-        matches = load_completed_results(query)
+        # Only handles this caller may use count as candidates: a foreign session
+        # sharing a prefix must not make the owner's own lookup ambiguous, and a
+        # foreign-only prefix must resolve to nothing rather than to a leak.
+        matches = {
+            sid: s for sid, s in load_completed_results(query).items()
+            if _process_access_allowed(s)
+        }
         with self._lock:
             matches.update({
                 sid: s for store in (self._running, self._finished)
-                for sid, s in store.items() if sid.startswith(query)
+                for sid, s in store.items()
+                if sid.startswith(query) and _process_access_allowed(s)
             })
         return next(iter(matches.values())) if len(matches) == 1 else None
 
@@ -2247,10 +2406,28 @@ class ProcessRegistry(ProcessCheckpointMixin):
         status stack. Errors when no UI close sink is wired."""
         if self.on_close is None:
             return {"status": "error", "error": "close_terminal is only available in the Hermes desktop app."}
-        # The session may already be finished (or pruned) — the tab can still
-        # linger and be closed, so a missing session is not an error here.
+        sink = self.on_close
+        session = self.get(session_id)
+        if session is None:
+            # A FILTERED foreign handle is not a pruned tab. Both look like None
+            # from get(), so the identifiers are inspected directly — and only the
+            # identifiers: no detached refresh, no notification consumption —
+            # before any UI callback. An ambiguous prefix must not become a close.
+            query = session_id if session_id.startswith("proc_") else f"proc_{session_id}"
+            with self._lock:
+                exists = any(
+                    sid.startswith(query)
+                    for store in (self._running, self._finished) for sid in store
+                )
+            if exists or not all(current_process_ui_scope()):
+                return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        else:
+            session_id = session.id  # the renderer needs the full, resolved id
         try:
-            self.on_close(self.get(session_id), session_id)
+            # The sink returns False when the close cannot be addressed to a window
+            # that owns the process; that is a refusal, not a success.
+            if sink(session, session_id) is False:
+                return {"status": "not_found", "error": f"No process with ID {session_id}"}
         except Exception as e:
             return {"status": "error", "error": str(e)}
         return {
@@ -2262,7 +2439,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
     def close_stdin(self, session_id: str) -> dict:
         """Close a running process's stdin / send EOF without killing the process."""
         session = self.get(session_id)
-        msg = "EOF sent" if session is not None and session._pty else "stdin closed"
+        if session is None:
+            # get() returning None is a DENIAL as well as an absence: a filtered
+            # foreign handle must not silently become an "stdin closed" success.
+            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if session.exited:
+            return {"status": "already_exited", "error": "Process has already finished"}
+        msg = "EOF sent" if session._pty else "stdin closed"
         return self._stdin_op(
             session_id, lambda pty: pty.sendeof(), lambda stdin: stdin.close(), {"status": "ok", "message": msg})
 
@@ -2286,7 +2469,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
         with self._lock:
             sessions.update(self._finished)
             sessions.update(self._running)
-        all_sessions = [self._refresh_detached_session(s) for s in sessions.values()]
+        all_sessions = [
+            self._refresh_detached_session(s) for s in sessions.values()
+            if _process_access_allowed(s)
+        ]
         if task_id or session_key:
             all_sessions = [
                 s for s in all_sessions
@@ -2537,17 +2723,22 @@ def _redact_process_result(result: dict) -> dict:
 
 
 def _list_processes(task_id) -> dict:
-    # Also surface session-scoped background processes (e.g. a forgotten preview
-    # server): they share the gateway session_key and can block session reset.
-    session_key = ""
-    with suppress(Exception):
-        # See #29177.
-        from tools.approval_context import get_current_session_key
-        session_key = get_current_session_key(default="") or ""
+    """Model-visible process list — scoped by OWNERSHIP, never by a shared key.
+
+    A task id is not a visibility boundary: it arrives on the tool call, and a
+    host-local child carries a namespaced one (``host-local-<task>``), so
+    filtering by it both hid the caller's OWN work and made the list depend on a
+    key the caller supplies. The same goes for the container/session key, which
+    unrelated turns share — treating either as a boundary is the bearer-token
+    pattern this layer removes. The registry gate already scopes every entry
+    (live, finished, and recovered) to the caller.
+
+    ``include_retained`` keeps upstream's durable receipts visible, so a process
+    can still be found after the gateway restarts.
+    """
     return {"processes": [
         _redact_process_result(p)
-        for p in process_registry.list_sessions(
-            task_id=task_id, session_key=session_key or None, include_retained=True)]}
+        for p in process_registry.list_sessions(include_retained=True)]}
 
 
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
@@ -2605,6 +2796,17 @@ _MAX_HANDOFFS_PER_CHILD = 3
 
 
 def _handle_process(args, **kw):
+    """Model-facing entry point: every action runs inside the ownership scope.
+
+    The scope is what makes the gate in ``ProcessRegistry.get`` apply — inside it,
+    a handle the caller does not own resolves as unknown, so no action can reach
+    another conversation's process. Direct (non-model) callers are unaffected.
+    """
+    with model_process_scope():
+        return _dispatch_process(args, **kw)
+
+
+def _dispatch_process(args, **kw):
     action = args.get("action", "")
     # Coerce to string — some models send session_id as an integer
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""

@@ -124,7 +124,7 @@ from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
 from gateway.platforms.base import (
-    MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
+    MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, has_media_marker, is_network_accessible,
     validate_media_delivery_path)
 from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from agent.redact import redact_sensitive_text
@@ -876,7 +876,7 @@ def _resolve_media_to_data_urls(text: str) -> str:
     server paths); non-image/unreadable paths stay untouched. Security: the shared
     ``MEDIA_TAG_CLEANUP_RE`` anchor + ``validate_media_delivery_path`` denylist — a bare-token
     match would let a traversal path in the reply exfiltrate any readable image."""
-    if not text or "MEDIA:" not in text:
+    if not text or not has_media_marker(text):
         return text
     import base64
 
@@ -2267,6 +2267,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        # Owner-profile decision (see test_every_gateway_agent_construction_decides_the_owner_profile):
+        # a raw API call is authenticated with the operator's own API_SERVER_KEY, so it is the
+        # owner and keeps USER.md. A hosted-room dispatch runs a turn for a room MEMBER, who is
+        # not the owner, so the owner's personal profile stays out of that prompt.
+        agent_kwargs["skip_user_profile"] = room_dispatch is not None
         agent = AIAgent(**agent_kwargs)
         route_source = (
             "session_model_lock" if confirmed_runtime_lock

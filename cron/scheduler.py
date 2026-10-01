@@ -46,6 +46,11 @@ from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
 from agent.memory_provider import ctx_bound
+from cron.agent_turn_context import (
+    reset_cron_agent_turn, set_cron_agent_turn)
+from tools.approval import (
+    CronSilenceState, get_cron_silence_state, reset_cron_silence_state,
+    set_cron_silence_state)
 from agent.turn_failure_copy import is_max_iteration_handoff
 
 logger = logging.getLogger(__name__)
@@ -500,10 +505,19 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str]:
     """
     per_job = job.get("enabled_toolsets")
     if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        merged = _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
+        # Always expose the native silence tool: it is the ONLY reliable way for a
+        # cron agent to suppress delivery (string markers leaked verbatim — incident
+        # cron_4fa958ec7c45). A per-job enabled_toolsets override must never strip it.
+        if "cronjob_silent" not in merged:
+            merged.append("cronjob_silent")
+        return merged
     try:
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
-        return sorted(_get_platform_tools(cfg or {}, "cron"))
+        resolved = sorted(_get_platform_tools(cfg or {}, "cron"))
+        if "cronjob_silent" not in resolved:
+            resolved = sorted(resolved + ["cronjob_silent"])
+        return resolved
     except Exception as exc:
         raise RuntimeError(
             "Cron toolset resolution failed, so this run was refused rather than given every "
@@ -577,6 +591,31 @@ def _is_cron_silence_response(text: str) -> bool:
     from gateway.response_filters import is_autonomous_silence_response
 
     return is_autonomous_silence_response(text)
+
+
+def _cron_delivery_suppression_reason(text: str, success: bool) -> Optional[str]:
+    """Reason a *successful* cron result must NOT be delivered, or ``None``.
+
+    Extends the bare ``[SILENT]`` marker check to the broader confidentiality
+    filter shared with the live gateway lane: a job that "succeeds" but whose
+    output only *narrates* staying silent, or leaks its own tool mechanism, must
+    not be posted to the contact (both were observed reaching recipients). Only
+    successful results are screened — a failed run is routed to the operator
+    alert path by the caller regardless of content. Falls back to ``None`` (i.e.
+    deliver) if the shared filter is unavailable, so a filter import problem
+    never silently swallows real output.
+    """
+    if not success:
+        return None
+    if _is_cron_silence_response(text):
+        return "silence_marker"
+    try:
+        from gateway.response_filters import suppression_reason
+
+        return suppression_reason(text)
+    except Exception:
+        logger.debug("cron delivery suppression check failed", exc_info=True)
+        return None
 
 # Persistent pool for parallel cron jobs: tick() submits and returns; long jobs never block it.
 # Keyed by profile home: one host gateway multiplexes every profile, and ``max_parallel_jobs`` is a
@@ -1718,6 +1757,29 @@ def _blocked_config_result(job_id: str, job_name: str, _pf_reason: str) -> tuple
     return False, blocked_doc, "", f"{marker} {_pf_reason}"
 
 
+def _sanitize_provider_pin(snapshot, current: str, job_id: str) -> str:
+    """Return the per-job provider pin to honor, refusing the legacy poisoned ``custom`` value.
+
+    Older builds snapshotted the RESOLVED internal label ("custom" for any custom-provider entry
+    such as omniroute) instead of the requested name. Feeding "custom" back in does NOT round-trip:
+    it matches the literal [custom] config key, which points at a different — paid — base_url. Such
+    a snapshot cannot express intent, so ignore it and fall through to the live global default
+    rather than silently billing a paid provider. A missing/blank pin also returns "" (follow the
+    global default); any real provider name is preserved unchanged."""
+    pin = str(snapshot or "").strip()
+    if not pin:
+        return ""
+    if pin.lower() == "custom":
+        logger.warning(
+            "Job '%s': ignoring legacy provider snapshot 'custom' (ambiguous: the resolved "
+            "label collides with the literal [custom] provider key and would resolve to a "
+            "different, paid endpoint); falling back to the global default %r. "
+            "`hermes cron resnap %s` rewrites it to the round-trippable provider name.",
+            job_id, current, job_id)
+        return ""
+    return pin
+
+
 def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[dict, str]:
     """Resolve the runtime, walking the fallback chain on auth/transient-network errors. Returns
     ``(runtime, model)``; provider+model swap atomically (never swap only the provider while keeping
@@ -1729,7 +1791,10 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
     from hermes_cli.auth import AuthError
 
     model = jc.model
-    requested = job.get("provider") or jc.cron_default_provider or None
+    # Refuse a legacy poisoned bare "custom" provider pin (it would resolve to the paid [custom]
+    # endpoint); a real pin is preserved and drives precedence over cron.model_provider.
+    pinned_provider = _sanitize_provider_pin(job.get("provider"), jc.cron_default_provider, job_id)
+    requested = pinned_provider or jc.cron_default_provider or None
     try:
         # Do NOT pass HERMES_INFERENCE_PROVIDER as `requested`: it would override persisted config
         # and resurrect stale providers for unpinned jobs.
@@ -2277,7 +2342,19 @@ class _CronRunScope:
         self._var_map = _VAR_MAP
         # Resolve workdir BEFORE set_session_vars so it owns the _SESSION_CWD set/clear.
         self.workdir = _resolve_job_workdir(job, job_id)
+        # Mint a fresh host-owned execution identity for this run, derived from the job and
+        # per-fire execution id (never from the stored delivery origin, from model task
+        # arguments, or from a shared terminal/container/session key). Process ownership
+        # matches on this principal, so without it a cron worker cannot prove that a process
+        # it spawned is its own — it could only reach it via the session key, which is exactly
+        # the bearer-token path contact isolation removes. A trailing uuid keeps concurrent
+        # runs (and repeat fires of the same job) distinct even when execution_id is reused
+        # or absent; set_session_vars binds it to the _EXECUTION_PRINCIPAL ContextVar and
+        # exit()'s clear_session_vars resets it on every success/error/cancel path.
+        self._execution_principal = "cron:{}:{}".format(
+            execution_id or job_id or "job", uuid.uuid4().hex)
         self._ctx_tokens = set_session_vars(
+            execution_principal=self._execution_principal,
             platform="",
             chat_id="",
             chat_name="",
@@ -2524,9 +2601,40 @@ def run_job(
             session_db=_session_db)
         _audit = _FireAudit(job, job_id, model)
 
-        result = _run_agent_with_watchdog(
-            agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
-            worker_state=_worker_state)
+        # Native-silence execution binding (the seam the API+toolset landing left inert).
+        # Both are ContextVars, bound HERE (in run_job's own context) so the
+        # ``contextvars.copy_context()`` inside ``_run_agent_with_watchdog`` captures them and
+        # propagates them into the agent's worker thread — and no further. Why bind on this frame
+        # rather than deeper: the cron ticker is an in-process daemon thread sharing os.environ with
+        # every live conversation, so this MUST be task-local ContextVar state, never a process
+        # global (see cron/agent_turn_context.py). While bound:
+        #   * ``is_cron_agent_turn()`` is True, so the always-injected ``cronjob_silent`` tool
+        #     authorises (it refuses, never silently no-ops, outside a cron turn), and the
+        #     reply-decision gate knows not to order this prompt to call ``send_message``.
+        #   * a FRESH ``CronSilenceState`` is bound per fire; the tool records its decision by
+        #     mutating that shared object via ``note_cron_silence_decided``.
+        # We read the decision back in the ``finally`` (while still bound, after the worker
+        # finished) and stamp it on the per-fire ``job`` dict — the same fire-local marker pattern
+        # as ``_model_unreachable``/``_quota_hold_seconds``, consumed and popped by the
+        # delivery/bookkeeping tail. Reset order is the strict reverse of bind (silence, then turn),
+        # in a ``finally`` so success / error / inactivity-cancel all restore cleanly and no stale
+        # cron-turn or silence state can leak into the next job or a concurrent context.
+        _cron_silence_state = CronSilenceState()
+        _cron_turn_token = set_cron_agent_turn(True)
+        _cron_silence_token = set_cron_silence_state(_cron_silence_state)
+        try:
+            result = _run_agent_with_watchdog(
+                agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
+                worker_state=_worker_state)
+        finally:
+            # Read the native decision BEFORE unbinding. The tool mutated this exact object in the
+            # worker's copied context (copy_context shares the instance by reference), so a call to
+            # ``cronjob_silent`` this fire is visible here regardless of what text the run produced.
+            _native_silence = get_cron_silence_state()
+            if _native_silence is not None and _native_silence.decided:
+                job["_cron_native_silence"] = True
+            reset_cron_silence_state(_cron_silence_token)
+            reset_cron_agent_turn(_cron_turn_token)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
@@ -2983,14 +3091,38 @@ def _save_compose_deliver(
             d.should_deliver = False
             logger.info(
                 "Job '%s': suppressing failure notice — automatic re-run pending", job["id"])
-    # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
-    # not be swallowed; bracketed-prefix / trailing-line tolerance is kept.
-    if d.should_deliver and d.success and _is_cron_silence_response(deliver_content):
-        # Cron silence suppression — see _is_cron_silence_response. Replaces the old `SILENT_MARKER in
-        # ...upper()` substring check, which both leaked bracketless near-markers ("SILENT" / "NO_REPLY")
-        # and wrongly swallowed a real report that merely quoted "[SILENT]" mid-sentence (#51438, #46917).
-        logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+    # Native structural silence (cronjob_silent tool) is authoritative and takes precedence over
+    # the legacy string-marker heuristic below: the running cron agent CALLED a tool whose
+    # vocabulary hermes-agent owns, so there is no guessing at what a free-text response "meant".
+    # ``job["_cron_native_silence"]`` was stamped by run_job's execution binding after reading the
+    # per-fire CronSilenceState the tool mutated. Suppress ALL delivery/mirror/ledger-delivered
+    # outcome for this fire — full stop, regardless of any text the response also carried. This is
+    # the delivery-suppression half of the native-silence seam; the string-based check is kept
+    # (never removed) so job prompts not yet updated to call the tool still fall back to it.
+    if d.should_deliver and d.success and job.get("_cron_native_silence"):
+        logger.info(
+            "Job '%s': agent called cronjob_silent — skipping delivery (native silence)",
+            job["id"])
         d.should_deliver = False
+    # Not a substring check: bare "SILENT"/"NO_REPLY" or a report quoting "[SILENT]" must
+    # not be swallowed; bracketed-prefix / trailing-line tolerance is kept. Beyond the bare
+    # silence marker we also suppress leaked silence *narration* and tool-mechanism narration
+    # via the shared gateway filter — both reached recipients on successful ticks.
+    if d.should_deliver:
+        _suppression = _cron_delivery_suppression_reason(deliver_content, d.success)
+        if _suppression:
+            # Cron silence suppression — see _cron_delivery_suppression_reason. Replaces the old
+            # `SILENT_MARKER in ...upper()` substring check, which both leaked bracketless
+            # near-markers ("SILENT" / "NO_REPLY") and wrongly swallowed a real report that merely
+            # quoted "[SILENT]" mid-sentence (#51438, #46917), and now also catches silence
+            # narration / tool-mechanism leaks the bare marker check missed.
+            if _suppression == "silence_marker":
+                logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            else:
+                logger.warning(
+                    "Job '%s': delivery suppressed (%s) — output saved, not sent",
+                    job["id"], _suppression)
+            d.should_deliver = False
 
     if d.should_deliver and fence.lost():
         d.should_deliver = False
@@ -3059,6 +3191,9 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
     if not d.success and _hold_s:
         # Provider window closed for a known duration: park past it (cron/quota_hold.py, #89376).
         mark_kwargs["quota_hold_seconds"] = _hold_s
+    # Clear the per-fire native-silence marker so it can never bleed into a later reuse of this
+    # job dict (fire-local by construction like _model_unreachable; popped for the same hygiene).
+    job.pop("_cron_native_silence", None)
     if d.success and not d.delivery_error and d.should_deliver and job.get("last_delivery_queued"):
         mark_kwargs["status"] = "delivery_queued"
     if fire_owner is not None:

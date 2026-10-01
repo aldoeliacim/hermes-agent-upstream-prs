@@ -28,6 +28,10 @@ _GLOBAL_DEFAULTS: dict[str, Any] = {
     # Delete tool-progress / "⏳ Working" bubbles after a SUCCESSFUL final response where deletion is
     # supported (Telegram); failed runs keep them as breadcrumbs.
     "cleanup_progress": False,
+    # Processing-reaction ack mode: "static" (fixed 👀→👍/👎 lifecycle), "smart" (contextual,
+    # anti-repeat picker in gateway/processing_reaction.py), or "off". Per-platform overridable
+    # via display.platforms.<platform>.processing_reaction. Default keeps upstream behaviour.
+    "processing_reaction": "static",
     # Working-state text on text-rendering indicators (Slack assistant status): "full"/true = verb +
     # argument preview, "verb" = verb only (keeps paths out of shared channels), "off"/false = static.
     "live_status": "full",

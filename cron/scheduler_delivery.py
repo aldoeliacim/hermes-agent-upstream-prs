@@ -166,6 +166,29 @@ def _target_mirror_eligible(
     return False
 
 
+def _chat_id_is_dm(platform_name: str, chat_id) -> bool:
+    """DM shape of an origin-less target (home-channel fallback) from the chat id alone.
+
+    A wrong answer seeds the brief under a key no reply resolves to: a Telegram private-chat
+    topic typed ``group`` lands in ``…:group:<id>:<thread>`` while the user's reply builds
+    ``…:dm:<id>:<thread>`` — the reply then runs without the brief it answers. Only
+    platform-guaranteed id shapes count; anything else stays non-DM (the prior behavior).
+    Telegram: users have positive ids, groups/supergroups/channels negative.
+    WhatsApp: ``@g.us`` is a group, ``@s.whatsapp.net``/``@lid`` a person. Slack: ``D…``.
+    """
+    cid = str(chat_id or "").strip()
+    platform = str(platform_name or "").lower()
+    if not cid:
+        return False
+    if platform == "telegram":
+        return cid.isdigit()
+    if platform == "whatsapp":
+        return cid.endswith("@s.whatsapp.net") or cid.endswith("@lid")
+    if platform == "slack":
+        return cid.startswith("D")
+    return False
+
+
 def _inchannel_seed_allowed(*, is_dm: bool, user_id: Optional[str]) -> bool:
     """Whether the flat in_channel seed may run. Group keys are user-isolated
     (``…:group:<chat_id>:<user_id>``): seeding without a real user_id creates an orphan session no
@@ -511,6 +534,66 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
         if home is not None and home.thread_id:
             return str(home.thread_id)
     return None
+
+
+def _target_is_home_channel(target: dict) -> bool:
+    """Exact owner-home match for metadata-bearing cron delivery."""
+    platform_name = str(target.get("platform") or "").strip().lower()
+    chat_id = str(target.get("chat_id") or "").strip()
+    home_chat_id = _get_home_target_chat_id(platform_name)
+    if not platform_name or not chat_id or not home_chat_id:
+        return False
+    if platform_name == "whatsapp":
+        from gateway.whatsapp_identity import expand_whatsapp_aliases
+
+        chat_matches = bool(
+            expand_whatsapp_aliases(chat_id) & expand_whatsapp_aliases(home_chat_id)
+        )
+    else:
+        chat_matches = chat_id == home_chat_id
+    if not chat_matches:
+        return False
+    target_thread = str(target.get("thread_id") or "").strip()
+    home_thread = str(_get_home_target_thread_id(platform_name) or "").strip()
+    return target_thread == home_thread
+
+
+_NON_OWNER_CRON_FAILURE = (
+    "No pude completar esta revisión programada. Quedó reportado para corregirlo."
+)
+
+
+def _non_owner_withhold_reason(content: str) -> Optional[str]:
+    """Why cron output must not reach a NON-owner target, or ``None``.
+
+    The interactive reply path and ``send_message(target="current")`` both refuse internal
+    artifacts and the deterministic privacy classes; cron ``origin`` delivery to a contact is
+    the same exposure through a different door (a scheduled status job delivered a raw
+    ``<summary>`` handoff with internal service commands to a contact). Same classifiers,
+    so the doors cannot drift apart.
+    """
+    from agent.turn_final_response import internal_artifact_kind
+    from gateway.delivery_judge import deterministic_privacy_leak_reason
+
+    return internal_artifact_kind(content) or deterministic_privacy_leak_reason(content)
+
+
+def _cron_content_for_target(
+    job: dict, content: str, target: dict, wrap_response: bool, *, for_failure: bool = False,
+) -> str:
+    """Expose operational failures/metadata only on the operator's exact home surface."""
+    is_home = _target_is_home_channel(target)
+    if for_failure and not is_home:
+        return _NON_OWNER_CRON_FAILURE
+    if not wrap_response or not is_home:
+        return content
+    task_name = job.get("name", job["id"])
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job.get('id', '')})\n"
+        f"-------------\n\n"
+        f"{content}"
+    )
 
 
 def _iter_home_target_platforms():
@@ -1740,9 +1823,61 @@ def _standalone_send(
         return _failed(e)
 
 
+def _record_cron_delivery_obligation(job: dict, target: dict, content: str) -> Optional[str]:
+    """Record one cron target before its first send attempt; never block delivery."""
+    try:
+        from gateway.delivery_ledger import (
+            compute_obligation_id,
+            ledger_enabled,
+            mark_attempting,
+            record_obligation,
+        )
+
+        if not ledger_enabled():
+            return None
+        platform = str(target.get("platform") or "")
+        chat_id = str(target.get("chat_id") or "")
+        thread_id = target.get("thread_id")
+        obligation_id = compute_obligation_id(
+            f"cron:{job['id']}",
+            f"{platform}:{chat_id}:{thread_id or ''}",
+            content,
+        )
+        record_obligation(
+            obligation_id=obligation_id,
+            session_key=f"cron:{job['id']}",
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            content=content,
+        )
+        mark_attempting(obligation_id)
+        return obligation_id
+    except Exception:
+        logger.debug("Job '%s': ledger record failed", job.get("id"), exc_info=True)
+        return None
+
+
+def _finish_cron_delivery_obligation(
+    job: dict, obligation_id: Optional[str], *, delivered: bool, error: str = ""
+) -> None:
+    """Finalize a cron delivery obligation after a definite target outcome."""
+    if not obligation_id:
+        return
+    try:
+        from gateway.delivery_ledger import mark_delivered, mark_failed
+
+        if delivered:
+            mark_delivered(obligation_id)
+        else:
+            mark_failed(obligation_id, error[:200])
+    except Exception:
+        logger.debug("Job '%s': ledger finalize failed", job.get("id"), exc_info=True)
+
+
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
-) -> None:
+) -> bool:
     """Standalone fallback for a target the live lane did not deliver."""
     job = t.job
     if t.is_relay:
@@ -1750,7 +1885,7 @@ def _deliver_standalone(
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     result, err = _standalone_send(t, content, media_files)
     if err is None and result and result.get("error"):
         # Not inside an except block — the error comes from the result dict, no traceback.
@@ -1759,7 +1894,7 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        return
+        return False
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
     for _w in (result.get("warnings") if isinstance(result, dict) else None) or []:
@@ -1772,6 +1907,7 @@ def _deliver_standalone(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
         enabled=t.mirror_this_target)
+    return True
 
 
 def _prepare_target_delivery(
@@ -1806,7 +1942,7 @@ def _prepare_target_delivery(
     # DM shape for BOTH the flatten gate and seed chat_type (Slack DM ids start with "D").
     origin_chat_type = str(origin.get("chat_type") or "").lower()
     is_dm_target = origin_chat_type == "dm" or (
-        not origin_chat_type and str(chat_id).startswith("D"))
+        not origin_chat_type and _chat_id_is_dm(platform_name, chat_id))
 
     # in_channel gate shared by thread-flatten and flat seed — they MUST match or brief and
     # session land in different places. Origin qualifies unconditionally; others only when the
@@ -1941,7 +2077,9 @@ def _deliver_result(
 
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
+    # The wrapper carries internal job metadata (job name + job_id), so it is applied
+    # per-target below (via _cron_content_for_target) only after proving an exact
+    # owner-home match. Non-owner surfaces get the bare, outcome-only content.
     wrap_response = True
     user_cfg = None
     with contextlib.suppress(Exception):
@@ -1952,30 +2090,20 @@ def _deliver_result(
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);
     # persisted as ``last_delivery_unverified`` so `hermes cron list` shows it.
     unverified_targets: list = []
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job.get('id', '')})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            "To stop or manage this job, send me a new message "
-            f"(e.g. \"stop reminder {task_name}\")."
-        )
-    else:
-        delivery_content = content
 
     from gateway.platforms.base import BasePlatformAdapter
     # Bridge media-policy config into the env vars the path validator reads. The gateway does this
     # at boot; standalone runs (`hermes cron run`) did not, silently dropping files. Idempotent.
     from gateway.media_policy import apply_media_policy_env
     apply_media_policy_env(user_cfg)
-    media_files, cleaned_delivery_content = BasePlatformAdapter.extract_media(delivery_content)
+    # Extract media from the RAW content; the owner-home header is a per-target concern applied
+    # after redaction, so it must not pass through media extraction here.
+    media_files, cleaned_content = BasePlatformAdapter.extract_media(content)
     # Redact at this single chokepoint, BEFORE the live-adapter / standalone send lanes below.
     # Shell-job stdout/stderr is already redacted where it is captured, but an LLM cron job's
     # response text reaches delivery unscanned — so a job that surfaced a credential (echoed a
     # failing curl with an API key, summarised a config file) sent it verbatim to the chat.
-    cleaned_delivery_content = _redact_cron_payload(cleaned_delivery_content, "delivery content")
+    cleaned_content = _redact_cron_payload(cleaned_content, "delivery content")
     requested_media = len(media_files)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
     # Policy-dropped attachments will never be sent on ANY lane — record them in run status.
@@ -2030,21 +2158,65 @@ def _deliver_result(
                     unverified_targets.append(bot_chat_error)
             continue
 
+        # Apply the owner-home metadata wrapper per target: only the operator's exact home
+        # channel receives the job name + job_id header; every other surface gets the bare,
+        # outcome-only content (no internal job identifiers leak off-home).
+        withheld = (
+            None if for_failure or _target_is_home_channel(target)
+            else _non_owner_withhold_reason(cleaned_content)
+        )
+        if withheld:
+            # Never send (or mirror into the contact's transcript) what the reply gates would
+            # refuse: the contact gets the neutral non-owner notice, and the run records a
+            # delivery error visible in `hermes cron list`.
+            logger.warning(
+                "Job '%s': output withheld from non-owner target %s:%s (%s)",
+                job["id"], target["platform"], target.get("chat_id"), withheld,
+            )
+            delivery_errors.append(
+                f"output withheld from {target['platform']}:{target.get('chat_id')} ({withheld})"
+            )
+            target_content = _NON_OWNER_CRON_FAILURE
+        else:
+            target_content = _cron_content_for_target(
+                job, cleaned_content, target, wrap_response, for_failure=for_failure,
+            )
+        target_mirror_text = (
+            target_content.strip()
+            if withheld or (for_failure and not _target_is_home_channel(target))
+            else mirror_text
+        )
+        # Record the delivery obligation before the first send attempt so a crash mid-send leaves
+        # a durable "attempting" row; finalized delivered/failed below after a definite outcome.
+        obligation_id = _record_cron_delivery_obligation(job, target, target_content)
         t = _prepare_target_delivery(
             job, target, adapters=adapters, loop=loop, config=config,
             notify_delivery=notify_delivery,
-            mirror_enabled=mirror_enabled, mirror_text=mirror_text, delivery_errors=delivery_errors)
+            mirror_enabled=mirror_enabled, mirror_text=target_mirror_text,
+            delivery_errors=delivery_errors)
         if t is None:
+            _finish_cron_delivery_obligation(
+                job,
+                obligation_id,
+                delivered=False,
+                error="target preparation failed",
+            )
             continue
         target_errors: list = []
         delivered = t.live_adapter_ready and _deliver_via_live_adapter(
-            t, cleaned_delivery_content, media_files,
+            t, target_content, media_files,
             target_errors=target_errors, delivery_errors=delivery_errors,
             unverified_targets=unverified_targets,
         )
         if not delivered:
-            _deliver_standalone(
-                t, cleaned_delivery_content, media_files, target_errors, delivery_errors)
+            delivered = _deliver_standalone(
+                t, target_content, media_files, target_errors, delivery_errors)
+        _finish_cron_delivery_obligation(
+            job,
+            obligation_id,
+            delivered=delivered,
+            error="; ".join(target_errors) or "delivery unconfirmed",
+        )
 
     # Filter-time drops apply to every target; report them once. A run whose every target was
     # suppressed sent nothing, so there is no drop to report.

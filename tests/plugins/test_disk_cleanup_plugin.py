@@ -17,6 +17,7 @@ import json
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -460,6 +461,26 @@ class TestPostToolCallHook:
             task_id="t4", session_id="s4",
         )
         # read_file should never trigger tracking.
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
+    def test_unreadable_path_does_not_raise(self, _isolate_env):
+        """Harvested remote paths may be unreadable on the local host."""
+        pi = _load_plugin_init()
+        real_exists = Path.exists
+
+        def fake_exists(self, **kwargs):
+            if str(self).startswith("/root/"):
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_exists(self, **kwargs)
+
+        with patch.object(Path, "exists", fake_exists):
+            pi._on_post_tool_call(
+                tool_name="terminal",
+                args={"command": "ssh e69 cat /root/e69/mkaudio.sh"},
+                result="ok /root/e69/mkaudio.log\n",
+                task_id="t5", session_id="s5",
+            )
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 

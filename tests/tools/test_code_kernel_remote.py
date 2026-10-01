@@ -15,6 +15,8 @@ import time
 import unittest
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from tools.code_kernel_remote import (
@@ -178,6 +180,22 @@ class TestDeathDetection(RemoteKernelBase):
 
 
 class TestOwnershipIsolation(RemoteKernelBase):
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Deliberate layer divergence from upstream. Upstream expects a tool-set change "
+            "to leave the PREVIOUS kernel running beside the new one, keyed by tool set "
+            "with the tool tuple as the key's last element (key[-1]). This layer does the "
+            "opposite on both counts, on purpose: a kernel holds the cell authority of the "
+            "turn that spawned it, so a tool-set change is an AUTHORITY TRANSITION — the "
+            "old kernel is torn down (verified) and never left running beside the new one, "
+            "because two live kernels would mean two principals with different capabilities "
+            "in the same namespace; and the key carries the host-bound authority scope as "
+            "its last element, so a scope change cannot reuse or revive a retired namespace "
+            "either. strict=True: if this layer ever starts keeping both kernels alive "
+            "again, this fails and forces the decision to be revisited."
+        ),
+    )
     def test_changed_tool_set_spawns_kernel_with_fresh_stubs(self):
         env = ScriptedEnv(_spawn_ok_handlers([_cell(), _cell()]))
         _run(env, tools=frozenset({"read_file"}))
@@ -279,8 +297,9 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
             worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
             worker.start()
-            # Snapshot: the worker thread inserts into the registry concurrently and a live
-            # dict iteration raises "dictionary changed size during iteration".
+            # Snapshot before iterating: the worker thread inserts and retires records
+            # while this waits, and iterating the live dict raises "dictionary changed
+            # size during iteration". The assertion below is unchanged.
             while not any(k.attached for k in list(_REMOTE_KERNELS.values())):
                 time.sleep(0.005)
             env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
@@ -317,6 +336,25 @@ class TestDispatchIntegration(unittest.TestCase):
         self.assertIn("kernel says hi", result["output"])
         self.assertEqual(result["kernel"]["execution_count"], 3)
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Deliberate layer divergence from upstream. Upstream's contract is that a "
+            "None return from execute_in_remote_kernel means 'fall open to the per-call "
+            "route', so this test patches that return value and expects the per-call path "
+            "to run. This layer removed that contract on purpose, because a bare None is "
+            "ambiguous: it cannot distinguish 'no kernel was ever established, nothing is "
+            "running' from 'a lifetime was refused or its retirement is unverified, and a "
+            "runner may still exist'. Blindly falling open on the second case is exactly "
+            "the authority hole this port exists to close. Instead the kernel layer calls "
+            "the fallback ITSELF, and only where the failure is definite — it receives an "
+            "explicit `fallback=` callback (accounted on the shared lifetime ledger, "
+            "cancellation owned by the lease holder), so a None reaching this seam can "
+            "only mean 'refuse'. The result is an explicit error, never a silent downgrade "
+            "to an unaccounted route. strict=True: if this layer ever starts falling open "
+            "on a bare None again, this fails and reopens the decision."
+        ),
+    )
     def test_execute_remote_falls_open_to_per_call(self):
         from tools.code_execution_tool import _execute_remote
         from unittest.mock import MagicMock

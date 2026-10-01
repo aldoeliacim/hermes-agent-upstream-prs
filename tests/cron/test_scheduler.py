@@ -117,6 +117,23 @@ class TestPerJobToolsetMcpMerge:
         assert not (set(result) & self._enabled_names())
 
 
+        # No per-job list -> must delegate to _get_platform_tools (the platform
+        # fallback), NOT the per-job merge. Stub the platform resolver and assert
+        # it is the path taken and its result is returned.
+        job = {"enabled_toolsets": None}
+        sentinel = ["web", "finnhub"]
+        with patch("hermes_cli.tools_config._get_platform_tools",
+                   return_value=set(sentinel)) as m_platform:
+            result = _resolve_cron_enabled_toolsets(job, self.CFG)
+        m_platform.assert_called_once()
+        # _get_platform_tools args: (cfg, "cron")
+        assert m_platform.call_args[0][1] == "cron"
+        # cronjob_silent is always injected (native silence tool must never be
+        # strippable); the platform result must otherwise pass through intact.
+        assert set(result) == set(sentinel) | {"cronjob_silent"}
+
+
+
 
     def test_resolver_keeps_memory_in_per_job_list(self):
         result = _resolve_cron_enabled_toolsets(
@@ -133,7 +150,8 @@ class TestPerJobToolsetMcpMerge:
             return_value={"web", "memory", "file"},
         ):
             result = _resolve_cron_enabled_toolsets(job, {})
-        assert result == ["file", "memory", "web"]
+        # cronjob_silent is always injected; platform tools otherwise preserved (sorted).
+        assert result == ["cronjob_silent", "file", "memory", "web"]
 
     def test_resolver_failure_fails_closed_instead_of_every_toolset(self):
         """An unreadable cron-platform restriction must not become ``None`` (= all toolsets,
@@ -142,10 +160,11 @@ class TestPerJobToolsetMcpMerge:
         job = {"enabled_toolsets": None}
         with pytest.raises(RuntimeError, match="toolset resolution failed"):
             _resolve_cron_enabled_toolsets(job, {"platform_toolsets": "oops"})
-        # Per-job lists never touch the platform resolver: an unknown name still resolves.
+        # Per-job lists never touch the platform resolver: an unknown name still resolves
+        # (cronjob_silent is appended by the always-inject rule).
         assert _resolve_cron_enabled_toolsets(
             {"enabled_toolsets": ["nonexistent_ts"]}, {"platform_toolsets": "oops", "mcp_servers": {}}
-        ) == ["nonexistent_ts"]
+        ) == ["nonexistent_ts", "cronjob_silent"]
 
 
 class TestResolveOrigin:
@@ -352,6 +371,137 @@ class TestDeliverResultWrapping:
             (root,),
         )
         return media_file.resolve()
+
+        """The operator's own home surface gets a job-identifying header so a
+        human can tell which job spoke and how to manage it. The old
+        agent-visible footer ("To stop or manage this job ...") is dropped:
+        per-target copy now carries only the header wrapper on home."""
+        from gateway.config import Platform
+
+        # Make telegram/123 the operator's home channel so the wrapper applies.
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "123")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Here is today's summary.")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "Cronjob Response: daily-report" in sent_content
+        assert "(job_id: test-job)" in sent_content
+        assert "-------------" in sent_content
+        assert "Here is today's summary." in sent_content
+        # New per-target contract: the footer is no longer appended anywhere.
+        assert "To stop or manage this job" not in sent_content
+
+    def test_non_owner_target_gets_bare_outcome_only_content(self, monkeypatch):
+        """A target that is NOT the operator's home surface must receive the
+        bare agent output with no job metadata: cron job identity / management
+        hints must never leak to a third-party chat."""
+        from gateway.config import Platform
+
+        # Home is a DIFFERENT chat id -> this delivery target is not home.
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "999")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, "Here is today's summary.")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert sent_content == "Here is today's summary."
+        assert "Cronjob Response" not in sent_content
+        assert "job_id" not in sent_content
+        assert "To stop or manage this job" not in sent_content
+
+    def test_failure_notice_to_non_home_recipient_is_generic(self, monkeypatch):
+        """A scheduled-run FAILURE delivered to a non-home surface must be an
+        outcome-only notice: provider/HTTP/config diagnostics never leak to a
+        contact or group. Detailed diagnostics stay on the owner's home only."""
+        from gateway.config import Platform
+
+        # Home is a DIFFERENT chat id -> this delivery target is not home.
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "999")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(
+                job,
+                "Cron 'daily-report' failed: HTTP 503 provider timeout. "
+                "Set cron.model_provider in config.yaml.",
+                for_failure=True,
+            )
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "HTTP" not in sent_content
+        assert "provider" not in sent_content.lower()
+        assert "config" not in sent_content.lower()
+        assert "no pude completar" in sent_content.lower()
+
+    def test_failure_notice_to_owner_home_keeps_diagnostics(self, monkeypatch):
+        """The owner's exact home surface remains the operational failure-report
+        destination and keeps the full diagnostics plus the job header."""
+        from gateway.config import Platform
+
+        # Home IS this delivery target's chat id -> home surface.
+        monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "123")
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        detail = "Cron 'daily-report' failed: HTTP 503 provider timeout."
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "test-job",
+                "name": "daily-report",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+            }
+            _deliver_result(job, detail, for_failure=True)
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][-1]
+        assert "Cronjob Response: daily-report" in sent_content
+        assert detail in sent_content
+
+
 
 
 

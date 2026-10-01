@@ -765,6 +765,12 @@ class GatewayBusySessionMixin:
             logger.debug("Failed to send busy-ack: %s", e)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Isolation admission first: a worker event that arrives while a
+        # session is busy is relayed to its worker, never merged into (or
+        # answered from) the private session that happens to share the key.
+        from gateway.isolated_routing import dispatch_isolated
+        if await dispatch_isolated(self, event):
+            return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
         if event.internal and event.allow_gateway_control:

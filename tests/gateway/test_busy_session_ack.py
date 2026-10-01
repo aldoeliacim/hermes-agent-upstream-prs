@@ -454,74 +454,25 @@ class TestBusySessionOnboardingHint:
         assert cfg["onboarding"]["seen"]["busy_input_prompt"] is True
 
 
-class TestLongRunningNotificationOwnership:
-    """The long-running heartbeat must stop once its run no longer owns the
-    session slot or the executor finished — otherwise a stale
-    'running: delegate_task' bubble outlives the run that spawned it (#12029).
-    """
-
-    def test_notification_stops_after_session_ownership_moves(self):
-        from gateway.run import GatewayRunner
-
-        runner = object.__new__(GatewayRunner)
-        runner._running_agents = {}
-
-        original_agent = MagicMock()
-        replacement_agent = MagicMock()
-        runner._running_agents["sess"] = replacement_agent
-
-        assert runner._should_emit_long_running_notification(
-            "sess", original_agent, executor_task=None
-        ) is False
-
-    @pytest.mark.asyncio
-    async def test_restart_during_heartbeat_edit_sends_no_fallback_bubble(self, monkeypatch):
-        """The guard is rechecked after the awaited edit: a restart that begins while the edit is
-        in flight must not be followed by a fresh "Working" send when that edit fails (#10990)."""
-        import asyncio
-        from types import SimpleNamespace
-        from gateway.run import GatewayRunner
-        from gateway.turn_context import TurnContext
-
-        monkeypatch.setenv("HERMES_AGENT_NOTIFY_INTERVAL", "0.01")
-        runner = object.__new__(GatewayRunner)
-        runner._running_agents = {}
-        runner._draining = runner._restart_requested = False
-        adapter = MagicMock()
-        first_send = AsyncMock(return_value=SimpleNamespace(success=True, message_id="hb-1"))
-        adapter.send = first_send
-
-        async def _edit_then_restart(*a, **k):
-            runner._restart_requested = True  # restart notice goes out while the edit is awaited
-            return SimpleNamespace(success=False)
-
-        adapter.edit_message = AsyncMock(side_effect=_edit_then_restart)
-        runner._delivery_adapter_for = lambda source: adapter
-        runner._agent_activity_summary = staticmethod(lambda agent: None)
-        agent = MagicMock()
-        runner._running_agents["sess"] = agent
-        disp = MagicMock()
-        disp._display_surface_mode.return_value = "on"
-        disp.resolve_display_setting.return_value = False
-        ctx = TurnContext(source=SimpleNamespace(chat_id="c", platform="telegram"), session_key="sess")
-        ctx.agent_holder[0] = agent
-
-        await asyncio.wait_for(runner._run_agent_notify_long_running(disp, ctx, [None]), 5)
-
-        assert first_send.await_count == 1  # the original heartbeat only
-        adapter.edit_message.assert_awaited_once()
-
-    @pytest.mark.parametrize("flag", ["_draining", "_restart_requested"])
-    def test_notification_stops_once_shutdown_or_restart_begins(self, flag):
-        """After the restart/shutdown notice a heartbeat would contradict it (#10990)."""
-        from gateway.run import GatewayRunner
-
-        runner = object.__new__(GatewayRunner)
-        runner._running_agents = {}
-        agent = MagicMock()
-        runner._running_agents["sess"] = agent
-        assert runner._should_emit_long_running_notification("sess", agent, executor_task=None) is True
-        setattr(runner, flag, True)
-        assert runner._should_emit_long_running_notification("sess", agent, executor_task=None) is False
+# #921: ``TestLongRunningNotificationOwnership`` was removed here. Its three tests exercised the
+# periodic "still working" heartbeat (``_run_agent_notify_long_running``) and its ownership gate
+# (``_should_emit_long_running_notification``). The heartbeat posted a progress chat message and
+# edited it in place — the exact ack-bubble machinery deleted for #921 — so the heartbeat is now a
+# no-op and the gate predicate was retired as dead code (see gateway/run_shutdown.py).
+#
+#   * ``test_notification_stops_after_session_ownership_moves`` and
+#     ``test_notification_stops_once_shutdown_or_restart_begins`` asserted the retired predicate's
+#     return value; with the predicate gone they test nothing that ships.
+#   * ``test_restart_during_heartbeat_edit_sends_no_fallback_bubble`` guarded a real invariant
+#     (#10990: after an in-flight edit fails and a restart begins, do NOT emit a fresh "Working"
+#     send). That invariant lived entirely inside the post→edit→recheck→fallback-send loop, and
+#     every one of those steps is gone. There is no progress post path and no edit path, so the
+#     "restart-during-edit followed by a fresh fallback bubble" scenario is structurally
+#     impossible — the test could only fail vacuously (its ``send`` await-count is 0, not 1).
+#
+# The surviving guard against re-growing any of this is tests/gateway/test_no_progress_ack_bubbles.py:
+# a reintroduced heartbeat that posts+edits a bubble trips both its behavioural assertion
+# (adapter.edits == [] and no interim send) and its AST source-scan (any progress/heartbeat-named
+# function calling ``.edit_message`` is flagged).
 
 

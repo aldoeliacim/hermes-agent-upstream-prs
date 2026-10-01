@@ -11,9 +11,10 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from agent.context_compressor import (
-    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
-    _newest_checkpoint_carrier, split_user_originated_turn)
-from agent.memory_manager import sanitize_context
+    _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY,
+    _is_checkpoint_item, _newest_checkpoint_carrier,
+    split_user_originated_turn)
+from agent.memory_manager import sanitize_context, sanitize_transcript_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -629,7 +630,7 @@ class SessionMessagesMixin:
         """Content as ``_rows_to_messages`` hands it to callers: user/assistant strings are sanitized and
         stripped on load, so a reloaded session's messages must be compared to rows through the same lens."""
         if role in {"user", "assistant"} and isinstance(content, str):
-            return sanitize_context(content).strip()
+            return sanitize_transcript_context(content).strip()
         return content
 
     def has_archived_messages(self, session_id: str) -> bool:
@@ -1419,7 +1420,7 @@ class SessionMessagesMixin:
             raise ValueError("rewind target is not a user-originated turn")
         live_content = live_view.get("content")
         if isinstance(live_content, str):
-            live_content = sanitize_context(live_content).strip()
+            live_content = sanitize_transcript_context(live_content).strip()
         if expected_target_content is not None and live_content != expected_target_content:
             raise RuntimeError("rewind target changed before it could be persisted")
         if preserve_compaction_handoff and handoff is None:

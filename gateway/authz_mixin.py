@@ -73,7 +73,7 @@ def _coerce_allow_set(raw) -> set[str]:
     if raw is None:
         return set()
     raw = _decode_json_list_literal(raw)
-    if isinstance(raw, list):
+    if isinstance(raw, (list, tuple, set, frozenset)):
         return {str(part).strip() for part in raw if str(part).strip()}
     return {part.strip() for part in str(raw).split(",") if part.strip()}
 
@@ -422,6 +422,32 @@ class GatewayAuthorizationMixin:
             return ""
         return str(self._adapter_setting(platform, f"_{kind}_policy", f"{kind}_policy", profile) or "").strip().lower()
 
+    def _whatsapp_group_allowlist(self, profile: Optional[str]) -> set[str]:
+        """WhatsApp group JIDs from the isolated env and the live adapter/config."""
+        groups = _coerce_allow_set(_auth_env("WHATSAPP_GROUP_ALLOWED_USERS"))
+        configured = self._adapter_setting(
+            Platform.WHATSAPP,
+            "_group_allow_from",
+            "group_allow_from",
+            profile,
+        )
+        groups |= _coerce_allow_set(configured)
+        return groups
+
+    def _whatsapp_group_chat_authorized(self, source: SessionSource, profile: Optional[str]) -> bool:
+        if source.platform != Platform.WHATSAPP or not source.chat_id:
+            return False
+        allowed = self._whatsapp_group_allowlist(profile)
+        if "*" in allowed:
+            return True
+        normalized_allowed = {
+            normalized
+            for group_id in allowed
+            if (normalized := _normalize_whatsapp_identifier(group_id))
+        }
+        normalized_chat = _normalize_whatsapp_identifier(source.chat_id)
+        return source.chat_id in allowed or bool(normalized_chat and normalized_chat in normalized_allowed)
+
     def _adapter_group_has_sender_allowlist(
         self, platform: Optional[Platform], chat_id: Optional[str], *, profile: Optional[str] = None
     ) -> bool:
@@ -542,6 +568,11 @@ class GatewayAuthorizationMixin:
         # Chat-scoped group allowlists must work with ``user_id is None`` (anonymous admins,
         # sender_chat posts, channel broadcasts).
         if is_group and source.chat_id:
+            # WhatsApp's group_allow_from contains CHAT JIDs, not sender IDs. Any
+            # member in a listed group is admitted here, without granting that
+            # member DM access below.
+            if self._whatsapp_group_chat_authorized(source, adapter_profile):
+                return True
             chat_allowlist_env = _GROUP_CHAT_ENV.get(source.platform, "")
             if chat_allowlist_env and _allows(_coerce_allow_set(_auth_env(chat_allowlist_env)), source.chat_id):
                 return True

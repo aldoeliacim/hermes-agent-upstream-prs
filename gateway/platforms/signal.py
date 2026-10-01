@@ -927,6 +927,27 @@ class SignalAdapter(BasePlatformAdapter):
         await self._with_target(params, chat_id, resolve=False)
         return await self._rpc("sendReaction", params) is not None
 
+    @staticmethod
+    def _split_message_id(message_id: str) -> Optional[tuple]:
+        """Reverse the ``author:timestamp_ms`` composite id into its parts.
+
+        Signal addresses messages by a composite of the sender and the timestamp,
+        which is why react/unreact can be addressed at all: the reaction API needs
+        both halves separately. ``rpartition`` (not ``split``) because a Signal
+        author can itself contain colons (a UUID-ish identifier); a malformed or
+        non-numeric tail yields None rather than a wrong target.
+        """
+        if not message_id or ":" not in str(message_id):
+            return None
+        author, _, ts = str(message_id).rpartition(":")
+        try:
+            return (author, int(ts)) if author else None
+        except ValueError:
+            return None
+
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def send_reaction(self, chat_id: str, emoji: str, target_author: str, target_timestamp: int) -> bool:
         """React to the message (author number/UUID, Signal ms timestamp) via signal-cli RPC."""
         ok = await self._send_reaction_rpc(chat_id, {
@@ -957,13 +978,18 @@ class SignalAdapter(BasePlatformAdapter):
         return not (sender and "*" not in self.dm_allow_from and sender not in self.dm_allow_from)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """React with 👀 when processing begins."""
-        if self._reactions_enabled(event) and (target := self._extract_reaction_target(event)):
-            await self.send_reaction(event.source.chat_id, "👀", *target)
+        """React when processing begins (emoji chosen by the base picker; none when suppressed)."""
+        if not self._reactions_enabled(event):
+            return
+        emoji = self._processing_ack_emoji(event)
+        if emoji and (target := self._extract_reaction_target(event)):
+            await self.send_reaction(event.source.chat_id, emoji, *target)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: "ProcessingOutcome") -> None:
-        """Swap 👀 for ✅/❌; on CANCELLED the 👀 stays to keep reflecting "in progress" (matches Telegram)."""
-        if outcome == ProcessingOutcome.CANCELLED or not self._reactions_enabled(event):
+        """Swap the start reaction for ✅/❌; on CANCELLED it stays to keep reflecting "in progress"
+        (matches Telegram). A suppressed turn (mode off / reply-gated silence) is never touched."""
+        if (outcome == ProcessingOutcome.CANCELLED or not self._reactions_enabled(event)
+                or self._processing_reaction_suppressed(event)):
             return
         if not (target := self._extract_reaction_target(event)):
             return

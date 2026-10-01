@@ -1275,6 +1275,14 @@ class GatewayInboundMixin:
         """Handle an incoming message from any platform: auth → command check → running-agent
         interrupt → get/create session → build context → run agent → return response."""
         from gateway.run import _AGENT_PENDING_SENTINEL
+        # Isolation admission runs FIRST — before any observer/plugin, profile
+        # mutation, private context, restore queue or slash command. A worker
+        # event (a contact on a bound route) is consumed here and must never
+        # reach the owner's private pipeline; True means consumed even when the
+        # event was denied, so there is no local fallback.
+        from gateway.isolated_routing import dispatch_isolated
+        if await dispatch_isolated(self, event):
+            return None
         _admitted = await self._hm_admit_event(event)
         if _admitted is None:
             return None

@@ -1091,7 +1091,9 @@ class _OutputScan:
         self.content_parts, self.reasoning_parts, self.tool_calls = [], [], []
         self.reasoning_items_raw, self.message_items_raw = [], []
         self.has_incomplete_items = response_status in _INCOMPLETE_STATUSES
-        self.saw_streaming_or_item_incomplete = response_status in {"queued", "in_progress"}
+        # An ``incomplete`` envelope (e.g. max_output_tokens) is authoritative regardless of a
+        # final item that still says ``completed`` — the envelope owns completion status.
+        self.saw_streaming_or_item_incomplete = response_status in {"queued", "in_progress", "incomplete"}
         self.saw_commentary_phase = self.saw_final_answer_phase = self.saw_reasoning_item = False
 
     def scan(self, output: List[Any], issuer_kind: Optional[str], issuer_model: Optional[str] = None) -> None:

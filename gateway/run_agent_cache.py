@@ -94,11 +94,95 @@ class GatewayAgentCacheMixin:
         except Exception:
             return {}
 
+    def _should_skip_user_profile_for_source(
+        self,
+        *,
+        source: SessionSource,
+        session_key: Optional[str] = None,
+        user_config: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Return True when the global USER.md owner profile should be hidden.
+
+        The built-in USER.md block describes the agent owner. In gateway chats
+        with other people, injecting it as "USER PROFILE (who the user is)" is
+        an identity hazard: the model can address a contact as the owner even
+        when Current Session Context says otherwise. MEMORY.md stays available
+        for operational/contact facts; only the owner identity profile is
+        suppressed unless this source is PROVEN to be the configured home user.
+
+        FAIL-CLOSED: any uncertainty (no home configured, unresolvable id,
+        exploding accessor) hides the profile. A missed profile for the owner
+        is an inconvenience; a leaked profile to a contact is the incident.
+
+        Owner proof reuses ``gateway.owner_authority.source_is_owner`` — the
+        single owner definition also used by the approval-suppression gate, so
+        the two gates never drift. That predicate deliberately does NOT walk
+        WhatsApp LID-alias bridge files (its docstring), because a security
+        deny-gate wants the strict form. This identity gate additionally
+        expands WhatsApp identifiers via ``expand_whatsapp_aliases`` (the same
+        resolver ``build_session_key`` relies on), so the owner speaking from
+        inside a group — where WhatsApp delivers an opaque ``…@lid`` instead of
+        the phone number — is still recognized and other members are not.
+        """
+        if not source or source.platform == Platform.LOCAL:
+            return False
+
+        from gateway.owner_authority import source_is_owner
+
+        # Base proof: exact / digit-normalized / session-key-tail match against
+        # the configured home channel(s). Single owner definition, no drift.
+        if source_is_owner(
+            getattr(self, "config", None),
+            source,
+            session_key=session_key,
+            user_config=user_config,
+        ):
+            return False
+
+        # WhatsApp-only extra recognition: expand both the source ids and the
+        # configured home ids to their full transitive LID<->phone-JID alias
+        # sets and look for any overlap. This recovers the owner-in-a-group
+        # case that the strict predicate cannot (opaque @lid vs phone home).
+        platform = source.platform
+        if platform == Platform.WHATSAPP:
+            try:
+                from gateway.owner_authority import _home_ids_for
+                from gateway.whatsapp_identity import expand_whatsapp_aliases as _wa_aliases
+
+                platform_name = (
+                    platform.value if hasattr(platform, "value") else str(platform)
+                )
+                home_ids = _home_ids_for(
+                    getattr(self, "config", None), platform, platform_name, user_config or {}
+                )
+                source_values = {
+                    str(source.chat_id or ""),
+                    str(source.user_id or ""),
+                    str(getattr(source, "chat_id_alt", "") or ""),
+                    str(getattr(source, "user_id_alt", "") or ""),
+                }
+                source_values.discard("")
+                expanded_src: set[str] = set()
+                for val in source_values:
+                    expanded_src |= _wa_aliases(val)
+                source_values |= expanded_src
+                expanded_home: set[str] = set()
+                for hid in home_ids:
+                    if hid:
+                        expanded_home |= _wa_aliases(hid)
+                home_ids |= expanded_home
+                if home_ids and home_ids.intersection(source_values):
+                    return False
+            except Exception:
+                pass
+
+        return True
+
     @staticmethod
     def _agent_config_signature(
         model: str, runtime: dict, enabled_toolsets: list, ephemeral_prompt: str,
         cache_keys: dict | None = None, user_id: str | None = None, user_id_alt: str | None = None,
-        skip_context_files: bool = False,
+        skip_context_files: bool = False, skip_user_profile: bool = False,
     ) -> str:
         """Stable key from agent config: change → cached AIAgent rebuilt; unchanged → reused (frozen
         prompt + schemas for cache hits). ``user_id`` / ``user_id_alt`` participate because Honcho
@@ -133,6 +217,12 @@ class GatewayAgentCacheMixin:
                 # skip_context_files changes the agent's frozen system prompt (context files in vs out):
                 # a toggled edit must rebuild the cached agent, not silently reuse it.
                 bool(skip_context_files),
+                # Same for skip_user_profile: two chats on one platform can differ ONLY in
+                # whether the built-in USER.md owner profile is injected. If both signatures
+                # collided, an owner turn and a contact turn under one session key would share
+                # a cached AIAgent whose frozen prompt already baked in (or out) the profile —
+                # the exact leak class this gate closes.
+                bool(skip_user_profile),
             ],
             sort_keys=True, default=str,
         )

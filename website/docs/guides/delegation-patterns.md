@@ -192,6 +192,21 @@ This is often the most efficient pattern: `execute_code` handles the 10+ sequent
 
 ---
 
+## Per-call model and provider
+
+Set `model` on a `delegate_task` call to select a model on the configured delegation provider (or inherited parent route). When switching providers, pass **both** `provider` and `model`:
+
+```python
+delegate_task(
+    tasks=[{"goal": "Review the API for authorization bugs"}],
+    provider="anthropic", model="claude-sonnet-4-5",
+)
+```
+
+The override applies to this invocation's children, not to global config or future calls. A new provider resolves its own credentials, endpoint, API mode and request settings; the prior delegation provider's endpoint/key/transport/fallback routes are not reused. A model-only override retains the configured route and its credentials; a model from another provider needs an explicit `provider`. For different providers in a fan-out, make separate `delegate_task` calls (each call has one route).
+
+---
+
 ## Inherited Tool Access
 
 Subagents inherit the parent's enabled toolsets. `delegate_task` does not accept a model-facing `toolsets` parameter, so delegated work cannot grant itself capabilities that the parent does not have. Configure the parent's tools before starting the conversation when a delegated task needs web, terminal, file, or other access. Hermes still strips child-blocked tools such as `clarify`, `memory`, and `send_message`; children keep `execute_code` for programmatic tool calling.

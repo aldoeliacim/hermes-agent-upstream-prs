@@ -337,6 +337,9 @@ import json, os, shlex, tempfile, threading, time
 
 _RPC_DIR = os.environ.get("HERMES_RPC_DIR") or os.path.join(tempfile.gettempdir(), "hermes_rpc")
 _seq = 0
+# Installed only by the persistent remote runner; per-call transport keeps its
+# original environment-based credentials.
+_rpc_context = None
 # `_seq += 1` is not atomic (read-modify-write), so concurrent _call()
 # invocations from multiple threads could allocate the same sequence number
 # and clobber each other's request files. Guard seq allocation with a lock.
@@ -346,12 +349,20 @@ _seq_lock = threading.Lock()
 def _call(tool_name, args):
     """Send a tool call request via file-based RPC and wait for response."""
     global _seq
+    authority = _rpc_context() if _rpc_context is not None else None
+    if _rpc_context is not None:
+        if authority is None or not authority[2]:
+            raise RuntimeError("No active execute_code cell: tool authority retired")
+        rpc_dir, rpc_token = authority[:2]
+    else:
+        rpc_dir = _RPC_DIR
+        rpc_token = os.environ.get("HERMES_RPC_TOKEN", "")
     with _seq_lock:
         _seq += 1
         seq = _seq
     seq_str = f"{seq:06d}"
-    req_file = os.path.join(_RPC_DIR, f"req_{seq_str}")
-    res_file = os.path.join(_RPC_DIR, f"res_{seq_str}")
+    req_file = os.path.join(rpc_dir, f"req_{seq_str}")
+    res_file = os.path.join(rpc_dir, f"res_{seq_str}")
 
     # Write request atomically (write to .tmp, then rename).
     # encoding="utf-8" is critical: on Windows-hosted remote backends
@@ -363,7 +374,7 @@ def _call(tool_name, args):
             "tool": tool_name,
             "args": args,
             "seq": seq,
-            "token": os.environ.get("HERMES_RPC_TOKEN", ""),
+            "token": rpc_token,
         }, f)
     os.rename(tmp, req_file)
 
@@ -371,6 +382,8 @@ def _call(tool_name, args):
     deadline = time.monotonic() + 300  # 5-minute timeout per tool call
     poll_interval = 0.05  # Start at 50ms
     while not os.path.exists(res_file):
+        if authority is not None and not authority[2]:
+            raise RuntimeError("No active execute_code cell: tool authority retired")
         if time.monotonic() > deadline:
             raise RuntimeError(f"RPC timeout: no response for {tool_name} after 300s")
         time.sleep(poll_interval)
@@ -546,40 +559,89 @@ def _finish_remote_kernel_result(kernel_result: Dict[str, Any], *,
                             {"tool_calls_made": kernel_result.get("tool_calls_made", 0)},
                             kernel=kernel_result.get("kernel", {"remote": True}))
     if result["status"] == "timeout":
-        _apply_timeout(result, f"Cell timed out after {timeout}s; the remote session kernel was "
-                               "killed and its state was lost. The next call starts fresh.")
+        # Truthful reporting: the timeout message carries what the kernel layer
+        # actually established. Saying "killed" here would assert a retirement that
+        # was never verified — when death could not be proven the note says so
+        # (quarantined, next cell refused), and that wording must survive into the
+        # caller's error rather than being overwritten by a fixed template.
+        _apply_timeout(result, f"Cell timed out after {timeout}s. "
+                       + result["kernel"].get("note", "Remote kernel retirement could not be confirmed."))
     elif result["status"] == "error" and kernel_result.get("error"):
         result["error"] = kernel_result["error"]
     return json.dumps(result, ensure_ascii=False)
 
 
 def _sandbox_tools_for(enabled_tools: Optional[List[str]]) -> frozenset:
-    """Enabled ∩ SANDBOX_ALLOWED_TOOLS, or every sandbox tool when the intersection is empty."""
-    return frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools or ())) or SANDBOX_ALLOWED_TOOLS
+    """Resolve the sandbox tool set from the caller's allowlist intent.
+
+    Three distinct intents, three answers:
+      * omitted (None)          -> the legacy default: every sandbox tool
+      * explicitly empty ([])   -> EMPTY, deliberately: the caller asked for no tools
+      * non-empty, no overlap   -> the legacy fallback: every sandbox tool
+    Collapsing the middle case into the third silently re-granted every sandbox tool to
+    a caller that had asked for none.
+    """
+    if enabled_tools is None:
+        return SANDBOX_ALLOWED_TOOLS
+    if not list(enabled_tools):
+        return frozenset()
+    return (frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+            or SANDBOX_ALLOWED_TOOLS)
 
 
 def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
                          sandbox_tools: frozenset, *, timeout: int, max_tool_calls: int,
-                         exec_start: float) -> str:
-    """Per-call script ship: stage hermes_tools.py + script.py in a fresh remote sandbox dir,
-    serve file-RPC from a polling thread, run, clean up."""
+                         exec_start: float, authority=None, lifetime=None, owner=None,
+                         key=None) -> str:
+    """Per-call script ship under the persistent attempt's still-held lease.
+
+    The launcher publishes recoverable launch identity BEFORE dispatch and registers it
+    in the same lifetime ledger the persistent kernel uses, so a lost transport reply is
+    quarantined rather than mistaken for "nothing ran", and retirement runs through the
+    same verified proof.
+    """
+    from tools.code_kernel_remote import (
+        REMOTE_POSIX_SESSION_SOURCE, RemoteKernel, _REMOTE_KERNELS, _REMOTE_KERNELS_LOCK,
+        _lifetime_error, _retire_verified,
+    )
     sandbox_dir = f"{_env_temp_dir(env)}/hermes_exec_{uuid.uuid4().hex[:12]}"
     quoted_sandbox_dir = shlex.quote(sandbox_dir)
     quoted_rpc_dir = shlex.quote(f"{sandbox_dir}/rpc")
-    tool_call_counter, stop_event, rpc_thread = [0], threading.Event(), None
+    tool_call_counter = [0]
+    stop_event = authority.stop if authority is not None else threading.Event()
+    rpc_thread = None
+    kernel = None
+    retired = False
+    cancelled = False
+    exit_code = None
+    status = None
     try:
         env.execute(f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10)
         rpc_token = secrets.token_urlsafe(32)
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py",
                              generate_hermes_tools_module(list(sandbox_tools), transport="file"))
-        _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
+        _ship_file_to_remote(env, f"{sandbox_dir}/user_code.py", code)
+        # The receipt names the exact process group after a lost reply; user code runs
+        # in this same process so retirement and the cell cannot diverge.
+        runner = REMOTE_POSIX_SESSION_SOURCE + (
+            "import os, runpy\n"
+            "os.makedirs('launch', exist_ok=True)\n"
+            "with open('launch/runner-pid.tmp', 'w', encoding='ascii') as f:\n"
+            "    f.write(str(os.getpid()))\n"
+            "os.replace('launch/runner-pid.tmp', 'launch/pid')\n"
+            "runpy.run_path('user_code.py', run_name='__main__')\n"
+        )
+        _ship_file_to_remote(env, f"{sandbox_dir}/script.py", runner)
         # Wrapped so the thread inherits the turn's approval context + callbacks
         # (tools.thread_context) — else sandbox RPC tool calls lose approval routing.
         # See #30882.
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, [], tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
+            kwargs={"dispatch": authority.dispatch} if authority is not None else {})
+        if lifetime is not None:
+            lifetime.poller = rpc_thread
         rpc_thread.start()
         env_prefix = (f"HERMES_RPC_DIR={quoted_rpc_dir} HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
                       "PYTHONDONTWRITEBYTECODE=1")
@@ -587,26 +649,90 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
         logger.info("Executing code on %s backend (task %s)...", env_type, effective_task_id[:8])
-        script_result = env.execute(f"cd {quoted_sandbox_dir} && {env_prefix} python3 script.py",
-                                    timeout=timeout)
+        if key is not None:
+            kernel = RemoteKernel(
+                env=env, env_identity=id(env), env_type=env_type, kernel_dir=sandbox_dir,
+                pid="", rpc_token=rpc_token, owner=owner or effective_task_id,
+                retiring=True)
+            with _REMOTE_KERNELS_LOCK:
+                _REMOTE_KERNELS[key] = kernel
+        if stop_event.is_set():
+            return json.dumps(_lifetime_error("Remote fallback authority retired before launch."))
+        script_result = env.execute(
+            f"cd {quoted_sandbox_dir} || exit; "
+            f"mkdir {quoted_sandbox_dir}/launch 2>/dev/null || exit; "
+            f"{env_prefix} python3 script.py & pid=$!; "
+            f"printf '%s\\n' \"$pid\" > launch/launcher-pid.tmp; "
+            f"mv launch/launcher-pid.tmp launch/pid; wait \"$pid\"",
+            timeout=timeout)
         stdout_text = script_result.get("output", "") or ""
         exit_code = script_result.get("returncode", -1)
         # Backend exit codes: 124 = timeout wrapper, 130 = SIGINT.
         status = _REMOTE_EXIT_STATUS.get(exit_code, "success")
-    except Exception as exc:
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            # A cancellation is not an error to report: the enclosing lease holder owns
+            # the retirement, and the primary signal must reach the caller unchanged.
+            cancelled = True
+            raise
         return _remote_failure(exc, exec_start, tool_call_counter[0])
     finally:
-        stop_event.set()
-        if rpc_thread is not None:
+        if authority is not None:
+            authority.retire()
+        else:
+            stop_event.set()
+        if rpc_thread is not None and rpc_thread.ident is not None and (not cancelled or kernel is None):
+            # Before launch identity exists no script ran, so the poller can only be
+            # idling (never inside an admitted host tool): a bounded join is safe there,
+            # and it lets the directory be removed. Once a script may be running, the
+            # admitted call is NOT cancellable — the shared lease keeps it accounted.
             rpc_thread.join(timeout=5)
-        try:
-            env.execute(f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15)
-        except Exception:
-            logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
-    result = _remote_result(status, stdout_text, exec_start,
+        if kernel is not None and not cancelled and key is not None:
+            retired = _retire_verified(key, kernel)
+        # `completed`: the script exited on its own. A timeout (124) or interrupt (130)
+        # is NOT completion — there the process may still be running, so its record and
+        # directory stay as the evidence retirement must be proven against.
+        completed = (not cancelled and exit_code is not None
+                     and status not in ("timeout", "interrupted"))
+        if completed and kernel is not None and key is not None:
+            # A record for a process that already exited must not stay behind as a
+            # permanent quarantine, even when the best-effort retirement above could not
+            # be proven: there is nothing left that could still be running.
+            from tools.code_kernel_remote import _REMOTE_LIFETIMES, _forget_lifetime, _slot_key
+            with _REMOTE_KERNELS_LOCK:
+                if _REMOTE_KERNELS.get(key) is kernel:
+                    _REMOTE_KERNELS.pop(key, None)
+                slot = _REMOTE_LIFETIMES.get(_slot_key(key))
+                if slot is not None:
+                    _forget_lifetime(_slot_key(key), slot)
+        if completed or (kernel is None and (rpc_thread is None or not rpc_thread.is_alive())):
+            # Safe to remove: either the script finished, or nothing ever launched and
+            # the poller is gone. A still-running or unproven script keeps its directory
+            # on purpose — that directory is the evidence retirement has to be proven on.
+            try:
+                env.execute(f"rm -rf {quoted_sandbox_dir}", cwd="/", timeout=15)
+            except BaseException as exc:
+                if not cancelled and not isinstance(exc, Exception):
+                    raise
+                # A secondary cancellation must not replace the original one.
+                logger.debug("Failed to clean up remote sandbox %s", sandbox_dir)
+        if (authority is not None and lifetime is not None and authority.is_draining()):
+            # THIS caller is giving up (timeout, error) while a host tool it admitted is
+            # still executing. That call cannot be cancelled and its effects cannot be
+            # rewound, so the slot is closed and registered as draining: the next caller
+            # is refused until the operation actually returns, instead of racing it.
+            from tools.code_kernel_remote import _mark_draining
+            _mark_draining(lifetime, authority)
+    result = _remote_result(status or "error", stdout_text, exec_start,
                             {"exit_code": exit_code, "tool_calls_made": tool_call_counter[0]})
     if status == "timeout":
-        _apply_timeout(result, f"Script timed out after {timeout}s and was killed.")
+        # Only claim a kill when retirement was actually PROVEN. An unverified
+        # retirement is its own answer: the lifetime stays quarantined.
+        _apply_timeout(result, (
+            f"Script timed out after {timeout}s and was killed." if retired else
+            f"Script timed out after {timeout}s; remote retirement is unverified. "
+            "The lifetime is quarantined; no new cell can start until retirement and "
+            "RPC drain are verified."))
         logger.warning("execute_code (remote) timed out after %ss (limit %ss) with %d tool calls",
                        result["duration_seconds"], timeout, tool_call_counter[0])
     elif status == "interrupted":
@@ -627,35 +753,39 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[L
     sandbox_tools, effective_task_id = _sandbox_tools_for(enabled_tools), task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
     exec_start = time.monotonic()
+    from tools.code_kernel_remote import execute_in_remote_kernel
+
+    def fallback(lifetime, authority, owner, key):
+        return json.loads(_run_remote_per_call(
+            env, env_type, code, effective_task_id, sandbox_tools,
+            timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start,
+            authority=authority, lifetime=lifetime, owner=owner, key=key,
+        ))
+
     try:
         py_check = env.execute("command -v python3 >/dev/null 2>&1 && echo OK", cwd="/", timeout=15)
         if "OK" not in py_check.get("output", ""):
             return _error_result(f"Python 3 is not available in the {env_type} terminal "
                                  "environment. Install Python to use execute_code with remote backends.")
-        # Session-kernel path: one persistent kernel per owner on the
-        # run-to-completion transport. Spawn failure falls OPEN to the per-call
-        # path below so a degraded remote host never blocks execution.
+        # Definite pre-launch failure may use the per-call route, but only while
+        # holding this same registered lifetime. Unknown launch/retirement fails closed.
         try:
-            # --- Session-kernel path (hermes-agent#96873) ------------------- Same always-on model as
-            # local: one persistent kernel per owner, rebuilt on the run-to-completion transport (detached
-            # runner + file cell protocol).
-            from tools.code_kernel_remote import execute_in_remote_kernel
             kernel_result = execute_in_remote_kernel(
                 code, env=env, env_type=env_type, task_env_id=effective_task_id,
                 sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
                 max_tool_calls=max_tool_calls, reset=bool(reset),
-                idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
+                idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)), fallback=fallback,
             )
         except Exception:
-            logger.warning("remote session-kernel path failed; falling back to per-call", exc_info=True)
+            logger.warning("remote session-kernel lifetime failed", exc_info=True)
             kernel_result = None
-        if kernel_result is not None:
-            return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
-        logger.info("remote session kernel unavailable on %s; using per-call path", env_type)
+        if kernel_result is None:
+            return _error_result("Remote lifetime failed before execution; no unaccounted fallback was started.")
+        if "output" in kernel_result:
+            return json.dumps(kernel_result, ensure_ascii=False)
+        return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
     except Exception as exc:
         return _remote_failure(exc, exec_start, 0)
-    return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
-                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
 
 
 # ---- Main entry point ----

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -168,6 +169,47 @@ _HANDOFF_FAIL_SQL = "UPDATE sessions SET handoff_state = 'failed', handoff_error
 
 class SessionGatewayMixin:
     """Routing index, session peers/orphans, hygiene streaks, heartbeats, handoffs."""
+
+    def set_sender_model_preference(self, platform: str, sender_id: str,
+                                    provider: Optional[str], model: Optional[str]) -> None:
+        """Local DB write; neither secrets nor chat/session IDs belong here."""
+        if not platform or not sender_id or bool(provider) != bool(model):
+            raise ValueError("platform/sender required; provider and model must both be set or cleared")
+        if provider and model:
+            self._execute_write(lambda conn: conn.execute(
+                "INSERT INTO gateway_sender_model_preferences (platform, sender_id, provider, model) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(platform, sender_id) DO UPDATE SET "
+                "provider=excluded.provider, model=excluded.model",
+                (platform, sender_id, provider, model)))
+        else:
+            self._execute_write(lambda conn: conn.execute(
+                "DELETE FROM gateway_sender_model_preferences WHERE platform=? AND sender_id=?",
+                (platform, sender_id)))
+
+    def get_sender_model_preference(self, platform: str, sender_ids) -> Optional[tuple[str, str]]:
+        """Return a unique preference across aliases; conflicting aliases fail closed."""
+        keys = sorted(set(sender_ids))
+        if not platform or not keys:
+            return None
+        rows = self._read_all(
+            "SELECT DISTINCT provider, model FROM gateway_sender_model_preferences "
+            f"WHERE platform=? AND sender_id IN ({','.join('?' for _ in keys)})",
+            (platform, *keys))
+        if len(rows) > 1:
+            raise ValueError("Conflicting sender model preferences for aliases")
+        return (rows[0]["provider"], rows[0]["model"]) if rows else None
+
+    def list_sender_model_preferences(self) -> list[tuple[str, str, str, str]]:
+        try:
+            rows = self._read_all(
+                "SELECT platform, sender_id, provider, model FROM gateway_sender_model_preferences "
+                "ORDER BY platform, sender_id")
+        except sqlite3.OperationalError as exc:
+            # A read-only handle does not run schema migration on an older state.db.
+            if "no such table: gateway_sender_model_preferences" in str(exc):
+                return []
+            raise
+        return [(r["platform"], r["sender_id"], r["provider"], r["model"]) for r in rows]
 
     def _reap_inactive_orphan_desktop_holders(
         self, holders: List[Tuple[int, str]], *, min_age_seconds: float) -> List[int]:

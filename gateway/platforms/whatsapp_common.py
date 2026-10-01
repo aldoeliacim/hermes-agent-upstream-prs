@@ -100,6 +100,15 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         return self._coerce_allow_list(
             _extra_or_wsecret(self.config.extra, "free_response_chats", "WHATSAPP_FREE_RESPONSE_CHATS"))
 
+    # Reply-policy hooks (see BasePlatformAdapter): expose WhatsApp's
+    # method-based mention / free-response config to the generic classifier so
+    # ``build_source`` stamps the correct ``reply_policy`` on every inbound turn.
+    def _adapter_require_mention(self) -> bool:
+        return self._whatsapp_require_mention()
+
+    def _chat_in_free_response_set(self, chat_id: str) -> bool:
+        return chat_id in self._whatsapp_free_response_chats()
+
     @staticmethod
     def _coerce_allow_list(raw) -> set[str]:
         """Parse allow_from / group_allow_from from config (list or JSON-list string) or env var (CSV)."""
@@ -154,7 +163,17 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         """Status updates (Stories) and Channel/Newsletter broadcasts — never reply
         (answering a Story spams the status feed; Channel posts aren't addressable)."""
         cid = (chat_id or "").strip().lower()
-        return cid == "status@broadcast" or cid.endswith(("@broadcast", "@newsletter"))
+        if cid == "status@broadcast":
+            return True
+        # status@s.whatsapp.net is the @s.whatsapp.net-domain spelling of the Status pseudo-chat
+        # (Baileys surfaces both). Without this, a Status update arriving under that JID slips past
+        # the broadcast gate and is treated as a regular DM on the open-DM path — replying spams the
+        # contact's Story feed.
+        if cid == "status@s.whatsapp.net":
+            return True
+        # @broadcast suffix covers status@broadcast plus any future broadcast-list variants;
+        # @newsletter is the Channel JID suffix.
+        return cid.endswith(("@broadcast", "@newsletter"))
 
     # ------------------------------------------------------------------ gating
     @staticmethod
@@ -234,15 +253,63 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
         body = str(data.get("body") or "")
         return any(pattern.search(body) for pattern in self._mention_patterns or ())
 
+    # ── Mention rendering ─────────────────────────────────────────────────
+    # Bodies carry mentions as bare numeric ids (``@<lid>`` / ``@<phone>``); the human-readable
+    # identity never appears inline. These power _clean_bot_mention_text's symmetric rewrite.
+    _MENTION_TOKEN_RE = re.compile(r"@(\d{5,})\b")
+    _MENTION_SELF_LABEL = "@you"
+    _MENTION_OTHER_SUFFIX = " (another person)"
+
+    def _mention_name_map(self, data: Dict[str, Any]) -> Dict[str, str]:
+        """Bare mention id → display name, from bridge-supplied ``mentionedNames``.
+
+        Falls back to the sender's own name so a self-referential tag resolves even without
+        group metadata. Unknown ids stay absent — the caller renders those explicitly rather
+        than guessing.
+        """
+        mapping: Dict[str, str] = {}
+        raw = data.get("mentionedNames")
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                bare = self._normalize_whatsapp_id(key).split("@", 1)[0]
+                name = str(value or "").strip()
+                if bare and name:
+                    mapping[bare] = name
+        sender_id = self._normalize_whatsapp_id(data.get("senderId")).split("@", 1)[0]
+        sender_name = str(data.get("senderName") or "").strip()
+        if sender_id and sender_name and sender_id not in mapping:
+            mapping[sender_id] = sender_name
+        return mapping
+
+    def _lookup_mention_name(self, bare_id: str, names: Dict[str, str]) -> Optional[str]:
+        return names.get(bare_id)
+
     def _clean_bot_mention_text(self, text: str, data: Dict[str, Any]) -> str:
+        """Rewrite raw ``@<jid-or-lid>`` mention tokens into human-readable, symmetric form.
+
+        WhatsApp puts opaque numeric ids in the body (``@142348...``) and carries the real
+        identities out-of-band (``mentionedIds`` / ``mentionedNames``). The agent only sees
+        the body, so a bare number is unreadable — and stripping only the bot's own mention
+        inverted the signal: a message to the bot lost its marker, while a message to a human
+        kept an ambiguous ``@<digits>``. Every mention is now resolved symmetrically — the bot
+        becomes an explicit self-marker, humans keep their names — so "addressed to me" and
+        "addressed to someone else" are distinguishable without guessing.
+        """
         if not text:
             return text
-        cleaned = text
-        for bot_id in self._bot_ids_from_message(data):
-            bare_id = bot_id.split("@", 1)[0]
-            if bare_id:
-                cleaned = re.sub(rf"@{re.escape(bare_id)}\b[,:\-]*\s*", "", cleaned)
-        return cleaned.strip() or text
+        bot_bare = {bid.split("@", 1)[0] for bid in self._bot_ids_from_message(data)} - {""}
+        names = self._mention_name_map(data)
+
+        def _replace(match: "re.Match") -> str:
+            bare_id = match.group(1)
+            if bare_id in bot_bare:
+                return self._MENTION_SELF_LABEL
+            name = self._lookup_mention_name(bare_id, names)
+            # Unknown participant: keep the id but mark it as another person so it can
+            # never be mistaken for a self-mention; name lookup must degrade to "not me".
+            return f"@{name}" if name else f"@{bare_id}{self._MENTION_OTHER_SUFFIX}"
+
+        return self._MENTION_TOKEN_RE.sub(_replace, text).strip() or text
 
     def _should_process_message(self, data: Dict[str, Any]) -> bool:
         chat_id = str(data.get("chatId") or "")

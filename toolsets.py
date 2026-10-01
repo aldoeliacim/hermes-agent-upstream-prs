@@ -27,6 +27,21 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     "execute_code", "delegate_task",
     "cronjob_manage",
+    # Explicit cron-run silence decision (tool-call, not a magic string).
+    # Deliberately has NO check_fn -- see tools/cronjob_silent_tool.py's
+    # module docstring for why: check_fn results are cached process-wide
+    # with a TTL (tools/registry.py::_check_fn_cached), which is the wrong
+    # mechanism for a signal that must be correct on every single cron
+    # tick, not "eventually consistent within ~30s". Visibility is instead
+    # controlled by cron/scheduler.py always injecting "cronjob_silent"
+    # into _resolve_cron_enabled_toolsets' output for every cron job --
+    # deterministic per-call toolset membership, zero caching. Listed here
+    # (in _HERMES_CORE_TOOLS) so tool_search's deferral logic never demotes
+    # it out of the model's direct schema into the search-only catalog,
+    # which a model can simply fail to search for. The handler's own
+    # is_cron_agent_turn() + CronSilenceState checks are the real
+    # authorization boundary; membership only controls schema visibility.
+    "cronjob_silent",
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     "kanban_show", "kanban_list",
     "kanban_complete", "kanban_block", "kanban_request_review",
@@ -38,6 +53,16 @@ _HERMES_CORE_TOOLS = [
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
+    # ── Native-surface tools restored from live 828ce02edf ──
+    # Members of _HERMES_CORE_TOOLS so they reach every platform's schema; each is
+    # further check_fn-gated at registration (send_message: reply_gate_mode=="tool";
+    # react: adapter.supports_reactions; whatsapp_action[_admin]: bridge configured,
+    # admin additionally owner-gated at call time). Without membership here they
+    # register but are never exposed — the exact bug that dropped them from the schema.
+    "send_message",
+    "react",
+    "whatsapp_action",
+    "whatsapp_action_admin",
 ]
 
 # Webhook payloads are untrusted third-party content: no file/system execution.
@@ -252,6 +277,30 @@ TOOLSETS = {
             "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin",
             "hermes-qqbot", "hermes-webhook", "hermes-yuanbao",
         ],
+    ),
+
+    # ── Native-surface standalone recovery entries (restored from live 828ce02edf) ──
+    # These exist ONLY so _recover_platform_native_toolsets() can restore each
+    # tool onto a platform with an explicit saved toolset list. A tool that
+    # registers but is never a member of ANY toolset is unreachable (CONTRIBUTING:
+    # "registers but never exposed" is a bug) — that is exactly how send_message,
+    # react and whatsapp_action silently vanished from the schema. Not user-facing
+    # in `hermes tools`.
+    "messaging": _ts(
+        "Cross-platform messaging: send_message, gated by check_fn on reply_gate_mode==\"tool\" (inert outside that mode).",
+        ["send_message"],
+    ),
+    "reactions": _ts(
+        "Emoji reaction on a message in the CURRENT conversation (react tool), gated by an uncached check_fn on the live adapter's supports_reactions + owner-or-tool-gated turn. Standalone entry so _recover_platform_native_toolsets() can restore it onto a platform with an explicit saved toolset list — not user-facing in `hermes tools`.",
+        ["react"],
+    ),
+    "whatsapp_action_recovery": _ts(
+        "WhatsApp bridge actions (react/status/etc), gated by check_fn on the WhatsApp bridge being configured. Standalone entry so _recover_platform_native_toolsets() can restore it onto a platform with an explicit saved toolset list — not user-facing in `hermes tools`.",
+        ["whatsapp_action"],
+    ),
+    "whatsapp_action_admin_recovery": _ts(
+        "WhatsApp bridge ADMIN actions (delete/profile/group-admin/privacy/block/contacts), gated by check_fn on the WhatsApp bridge being configured AND by a call-time owner-identity check inside the handler. Standalone entry so _recover_platform_native_toolsets() can restore it onto a platform with an explicit saved toolset list — not user-facing in `hermes tools`.",
+        ["whatsapp_action_admin"],
     ),
 }
 

@@ -97,6 +97,67 @@ _cfg_lock = threading.Lock()
 # compare/check/write transaction needs its own lock, not the unrelated config cache lock.
 _profile_ui_meta_lock = threading.Lock()
 _sessions_lock = threading.RLock()  # reentrant: _close_session_by_id may run under callers that already hold it
+
+
+def _wire_agent_terminal_output() -> None:
+    """Idempotently route background-process output (and tab-close requests) to
+    the desktop, keyed by process id. Read-only agent terminal tabs stream
+    `agent.terminal.output` chunks live instead of polling the output tail, and
+    `process_registry.request_close_terminal` emits `terminal.close` so the agent
+    can drop a tab without killing the process. Events are routed to the window
+    that owns the process (its gateway session); `_emit`/`write_json` is
+    `_stdout_lock`-guarded, so calling it from the registry's reader threads is
+    safe.
+
+    ``process_registry`` is imported INSIDE the function on purpose: callers (and
+    tests) replace the module attribute, and a call-time import picks that up
+    whereas a module-level binding would keep the original object.
+    """
+    from tools.process_registry import process_registry
+
+    has_output_sink = getattr(process_registry, "on_output", None) is not None
+    has_close_sink = getattr(process_registry, "on_close", None) is not None
+    if has_output_sink and has_close_sink:
+        return
+
+    def _owner_sid_for_process(session) -> str:
+        session_key = str(getattr(session, "session_key", "") or "")
+        if not session_key:
+            return ""
+        with _sessions_lock:
+            for sid, tui_session in _sessions.items():
+                if str(tui_session.get("session_key") or "") == session_key:
+                    return sid
+        return ""
+
+    def _emit_agent_terminal_output(session, chunk):
+        _emit(
+            "agent.terminal.output",
+            _owner_sid_for_process(session),
+            {"process_id": session.id, "chunk": chunk},
+        )
+
+    def _emit_agent_terminal_close(session, process_id):
+        if session is not None:
+            sid = _owner_sid_for_process(session)
+        else:
+            # A pruned process has no owner record: only close a tab in the
+            # positively bound current window, never broadcast an arbitrary id.
+            from tools.process_registry import current_process_ui_scope
+
+            key, sid = current_process_ui_scope()
+            with _sessions_lock:
+                if not key or _sessions.get(sid, {}).get("session_key") != key:
+                    return False
+        if not sid:
+            return False
+        _emit("terminal.close", sid, {"process_id": process_id})
+        return True
+
+    if not has_output_sink:
+        process_registry.on_output = _emit_agent_terminal_output
+    if not has_close_sink:
+        process_registry.on_close = _emit_agent_terminal_close
 _cfg_cache: dict | None = None
 _cfg_sig: tuple | None = None
 _cfg_path = None

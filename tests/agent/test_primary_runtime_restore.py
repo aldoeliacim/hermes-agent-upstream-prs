@@ -715,3 +715,60 @@ class TestSwitchModelRequestOverridesSnapshot:
             result = agent._restore_primary_runtime()
         assert result is True
         assert agent.request_overrides == overrides
+
+
+class TestDegradedSessionSelfHeal:
+    """A session can be left DEGRADED without _fallback_activated set: a fallback that FAILED to
+    activate (chain exhausted / provider unconfigured / no credentials) or a mid-turn credential
+    rebuild can mutate the live provider/api_mode/base_url/anthropic state away from the primary
+    snapshot while the flag stays False. The old code bailed on `not _fallback_activated` and
+    stranded the agent degraded for every later turn (the gateway caches agents across messages) —
+    observed as requests to the wrong host with 'Bearer None'. restore_primary_runtime must
+    self-heal when the live state diverges, and stay a no-op when it does not (no oscillation)."""
+
+    def test_self_heals_when_live_provider_diverges_without_fallback_flag(self):
+        agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+        primary_provider = agent.provider
+        primary_base_url = agent.base_url
+        # Flag was never set, but the live agent drifted off the primary provider/endpoint.
+        assert agent._fallback_activated is False
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            result = agent._restore_primary_runtime()
+
+        assert result is True
+        assert agent.provider == primary_provider
+        assert agent.base_url == primary_base_url
+
+    def test_noop_when_not_fallback_and_live_state_aligned(self):
+        """No divergence and no fallback flag: still a no-op returning False — the self-heal must
+        not fire on an already-healthy session (would announce a phantom recovery every turn)."""
+        agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+        assert agent._fallback_activated is False
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            result = agent._restore_primary_runtime()
+        assert result is False
+
+    def test_self_heal_does_not_oscillate_second_turn_is_noop(self):
+        """After one self-heal the live state matches primary again, so the next turn is a clean
+        no-op (False) — no restore/re-degrade oscillation across cached-agent turns."""
+        agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+        agent.provider = "openrouter"
+        agent.base_url = "https://openrouter.ai/api/v1"
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            first = agent._restore_primary_runtime()
+            second = agent._restore_primary_runtime()
+        assert first is True
+        assert second is False
+
+    def test_no_self_heal_without_primary_snapshot(self):
+        """Conservative: absent a primary snapshot there is nothing to compare against, so the
+        divergence check returns False and restore stays a no-op."""
+        agent = _make_agent(provider="custom", base_url="https://my-llm.example.com/v1")
+        agent._primary_runtime = None
+        agent.provider = "openrouter"
+        with patch("agent.process_bootstrap.OpenAI", return_value=MagicMock()):
+            result = agent._restore_primary_runtime()
+        assert result is False

@@ -1165,26 +1165,14 @@ class GatewayShutdownMixin:
             # SIGTERM never completed.
             await self._cleanup_agent_resources_off_loop(agent, context="shutdown finalize", session_key=session_key)
 
-    def _should_emit_long_running_notification(
-        self, session_key: Optional[str], agent: Any, executor_task: Optional[Any],
-    ) -> bool:
-        """Emit the heartbeat only while this task still owns the live run (not after ``/new`` rebinds).
-
-        Guards against a stale ``running: delegate_task`` heartbeat outliving the run that started it: stop
-        once the executor finishes, the agent is gone, or the session key has been rebound to a different
-        live agent (e.g. the user sent ``/new`` and a fresh agent took the slot mid-run, #12029).
-        """
-        if agent is None or (executor_task is not None and executor_task.done()):
-            return False
-        # Drain/restart already told the chat the task will be interrupted; a "still working"
-        # heartbeat after that notice reads as a contradiction (#10990).
-        if getattr(self, "_draining", False) or getattr(self, "_restart_requested", False):
-            return False
-        if session_key:
-            _hb_state = self._peek_session_state(session_key)
-            if (_hb_state.turn.agent if _hb_state else None) is not agent:
-                return False
-        return True
+    # #921: ``_should_emit_long_running_notification`` was retired here. It gated the periodic
+    # "still working" heartbeat (the progress-ack bubble that was posted then edited in place), and
+    # the heartbeat is now a no-op (see ``_run_agent_notify_long_running``). With no production
+    # caller left the predicate was dead code, so it was removed rather than kept as an orphan. The
+    # invariants it enforced (#12029 stale-heartbeat ownership, #10990 no "Working" bubble after a
+    # restart notice) are moot: there is no progress post/edit path for a stale or contradictory
+    # bubble to escape through, and ``tests/gateway/test_no_progress_ack_bubbles.py`` structurally
+    # forbids any progress/heartbeat function from calling ``.edit_message`` again.
 
     def _defer_agent_cleanup_until_future_done(self, future: asyncio.Future, agent: Any, *, context: str) -> None:
         """Clean up ``agent`` only after its executor future finishes (it may still use the agent's clients)."""
@@ -2119,6 +2107,11 @@ class GatewayShutdownMixin:
     async def _stop_impl(self) -> None:
         """Run every ``_stop_*`` phase under the thread-based shutdown watchdog."""
         from gateway.run import GatewayRunner
+        # Close the isolation listener first: stop admitting worker events and
+        # release its port before the drain work below can block for minutes.
+        _iso_runtime = getattr(self, "_isolated_runtime", None)
+        if _iso_runtime is not None:
+            await _iso_runtime.close()
         # Thread-based watchdog (asyncio timeouts cannot recover a frozen loop): dumps stacks and
         # os._exit past drain+grace so the service manager revives us. Skipped under pytest.
         # Arm a plain OS thread at the start of stop(); if teardown never finishes within drain+grace it
@@ -2159,6 +2152,10 @@ class GatewayShutdownMixin:
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        # Close admission SYNCHRONOUSLY, before the first await: a stop already
+        # in flight must not let a new isolated event open a listener, and this
+        # must hold even when no isolated event ever created a runtime.
+        self._isolated_stopped = True
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)

@@ -1256,7 +1256,8 @@ def _memory_provider_init_kwargs(agent, platform) -> Dict[str, Any]:
     return kwargs
 
 
-def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
+def _init_memory(agent, _agent_cfg, skip_memory, platform, *,
+                  skip_user_profile=False, memory_manager=None):
     # Persistent memory (MEMORY.md + USER.md) — loaded from disk
     agent._memory_store = None
     agent._memory_enabled = False
@@ -1282,9 +1283,13 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
                 MemoryStore, get_builtin_memory_config, get_builtin_memory_store_flags,
             )
             mem_config = get_builtin_memory_config(_agent_cfg)
-            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
+            agent._memory_enabled, _user_profile_flag = get_builtin_memory_store_flags(
                 _agent_cfg
             )
+            # USER.md describes the agent owner. Gateway sessions with non-owner contacts must not
+            # inject it as "who the user is", or the model can misidentify the current speaker as the
+            # owner. MEMORY.md remains available; only the owner profile is gated.
+            agent._user_profile_enabled = False if skip_user_profile else _user_profile_flag
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 agent._memory_store = MemoryStore(
@@ -2351,9 +2356,27 @@ def init_agent(
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str = None, capabilities: Optional[Dict[str, bool]] = None, cwd: Optional[str] = None,
+    skip_user_profile: bool = False,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
 ):
+    """Initialize the AI Agent (body of :meth:`AIAgent.__init__`).
+
+    Non-obvious parameters:
+      max_iterations: default unlimited (sys.maxsize); the budget is shared with subagents.
+      requested_provider: provider identity before runtime canonicalization.
+      cwd: logical session workspace, available to memory providers during construction;
+        None or empty leaves the runtime cwd resolver unpinned.
+      openrouter_min_coding_score: coding-score floor for ``openrouter/pareto-code`` only.
+      clarify_callback: ``(question, choices) -> str``; None → the clarify tool errors.
+      reasoning_config: None → ``{"enabled": True, "effort": "medium"}`` on OpenRouter.
+      prefill_messages: priming history. Anthropic Sonnet/Opus 4.6+ 400 on a trailing
+        assistant message — use structured outputs there instead.
+      skip_context_files: skip SOUL.md/.hermes.md/AGENTS.md/CLAUDE.md/.cursorrules injection;
+        load_soul_identity keeps ~/.hermes/SOUL.md as identity regardless.
+      skip_user_profile: force the owner USER.md block out of the system prompt (gateway
+        sessions whose source is not proven to be the owner). MEMORY.md stays.
+    """
     _install_safe_stdio()
 
     _params = locals()
@@ -2434,7 +2457,8 @@ def init_agent(
         _agent_cfg = {}
 
     _apply_display_config(agent, _agent_cfg, platform)
-    _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=memory_manager)
+    _init_memory(agent, _agent_cfg, skip_memory, platform,
+                 skip_user_profile=skip_user_profile, memory_manager=memory_manager)
     _apply_agent_section(agent, _agent_cfg)
     cs = _parse_compression_config(agent, _agent_cfg)
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(

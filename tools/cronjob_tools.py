@@ -558,6 +558,19 @@ def _with_guidance(result: Dict[str, Any], job: Dict[str, Any], deliver: Optiona
     return result
 
 
+def _cross_identity_delivery_error(
+    origin: Optional[Dict[str, Any]], *deliveries: Optional[str]
+) -> Optional[str]:
+    """Validate every outbound route against the requester's identity boundary."""
+    from cron.delivery_guard import check_cross_identity_delivery
+
+    for target in deliveries:
+        error = check_cross_identity_delivery(origin, target)
+        if error:
+            return error
+    return None
+
+
 def _action_create(a: Dict[str, Any]) -> str:
     prompt, script = a["prompt"], a["script"]
     deliver = _normalize_deliver_param(a["deliver"])
@@ -597,12 +610,23 @@ def _action_create(a: Dict[str, Any]) -> str:
     if a["continuity"] is not None:
         context_from = _apply_continuity(context_from, a["continuity"])
 
+    origin = _origin_from_env(a["schedule"])
+    resolved_deliver = _resolve_cron_context_deliver(deliver)
+    resolved_failure_deliver = _resolve_cron_context_deliver(
+        _normalize_deliver_param(a["failure_deliver"])
+    )
+    identity_error = _cross_identity_delivery_error(
+        origin, resolved_deliver, resolved_failure_deliver
+    )
+    if identity_error:
+        return tool_error(identity_error, success=False)
+
     from cron.scheduler import CronSchedulerRegistrationError, create_job_with_scheduler_registration
     try:
         job = create_job_with_scheduler_registration(
             prompt=prompt or "", schedule=a["schedule"], name=a["name"], repeat=a["repeat"],
-            deliver=_resolve_cron_context_deliver(deliver),
-            origin=_origin_from_env(a["schedule"]),
+            deliver=resolved_deliver,
+            origin=origin,
             skills=canonical_skills,
             model=_normalize_optional_job_value(a["model"]), provider=_normalize_optional_job_value(a["provider"]),
             base_url=_normalize_optional_job_value(a["base_url"], strip_trailing_slash=True),
@@ -614,7 +638,7 @@ def _action_create(a: Dict[str, Any]) -> str:
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"],
             pinned=bool(a["pinned"]),
-            failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
+            failure_deliver=resolved_failure_deliver,
             **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
                if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
@@ -856,6 +880,13 @@ def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
             return tool_error(error, success=False)
     if not updates:
         return tool_error("No updates provided.", success=False)
+    identity_error = _cross_identity_delivery_error(
+        job.get("origin"),
+        _pick(updates, job, "deliver"),
+        _pick(updates, job, "failure_deliver"),
+    )
+    if identity_error:
+        return tool_error(identity_error, success=False)
     updated = update_job(job["id"], updates)
     _notify_provider_jobs_changed_safe()
     # An update can switch modes or delivery — echo the same guidance as create.

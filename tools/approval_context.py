@@ -8,6 +8,8 @@ gate in :mod:`tools.approval`.
 import contextvars
 import logging
 import os
+from dataclasses import dataclass
+from typing import Any, Optional
 from hermes_cli.config import cfg_get
 from utils import env_var_enabled, is_truthy_value
 
@@ -329,3 +331,276 @@ def _get_approval_transport_config() -> tuple[str, str | None]:
         # prompt on a built-in surface the operator may not be watching.
         return "config-error", None
     return selected or "builtin", "builtin" if fallback == "builtin" else None
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Reply-gate delivery state: message source, per-turn delivery ledger, tool-gate
+# ──────────────────────────────────────────────────────────────────────────
+
+_current_message_source: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar(
+    "current_message_source",
+    default=None,
+)
+
+
+def set_current_message_source(source: Any) -> contextvars.Token:
+    """Bind the current gateway turn's inbound message source to this context."""
+    return _current_message_source.set(source)
+
+
+def get_current_message_source() -> Optional[Any]:
+    """Return the current gateway turn's inbound message source, or None.
+
+    None outside a live gateway turn (CLI, cron, subagent) — callers that need
+    a message source (e.g. send_message(target="current")) must surface a clear
+    error rather than guess.
+    """
+    return _current_message_source.get()
+
+
+def reset_current_message_source(token: contextvars.Token) -> None:
+    """Restore the prior message-source context."""
+    _current_message_source.reset(token)
+
+
+@dataclass
+class TurnDeliveryState:
+    """Per-inbound-message reply-gate decision counters.
+
+    tool_sends: successful send_message(target="current") deliveries.
+    decided_silent: explicit send_message(target="current", action="silent").
+    Both accumulate across the entire re-entrant follow-up chain for one
+    inbound message, because the object is created once at the outer per-turn
+    scope and shared by identity down every queued follow-up.
+    """
+
+    tool_sends: int = 0
+    decided_silent: int = 0
+
+    @property
+    def delivery_decided(self) -> bool:
+        """True once this turn has explicitly decided its delivery outcome.
+
+        The canonical reply-gate predicate. A turn is decided the moment it
+        either delivered to the current chat (a successful current-target
+        send_message) or recorded explicit silence (action="silent"). It is a
+        property on the identity-stable turn object rather than a process-global
+        flag: the in-process cron ticker and concurrent live conversations share
+        one process, so any global would leak one turn's decision into another.
+        The post-turn delivery block and the stream consumer both read this same
+        predicate, so streamed text and post-turn free text cannot disagree.
+        """
+        return self.tool_sends > 0 or self.decided_silent > 0
+
+
+_current_turn_delivery_state: contextvars.ContextVar[Optional["TurnDeliveryState"]] = (
+    contextvars.ContextVar("current_turn_delivery_state", default=None)
+)
+
+_current_turn_reply_tool_gated: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "current_turn_reply_tool_gated",
+    default=False,
+)
+
+
+
+
+def is_owner_source(source: Any) -> bool:
+    """True when ``source`` (a live turn's inbound message source) resolves,
+    for its own platform, to this deployment's configured home channel --
+    i.e. the message came from the owner's own identity on that platform.
+    False for any other sender and for an unresolvable/unconfigured source.
+
+    Platform-agnostic generalization of
+    ``tools.whatsapp_action_tool._is_owner_whatsapp_source`` -- reuse that
+    WhatsApp-specific helper directly when you already know the source is
+    WhatsApp (it also runs LID/phone-JID alias expansion this function
+    doesn't need to duplicate for other platforms). This function is for
+    disclosure/action gates that must work across ANY platform the gateway
+    is deployed on (e.g. send_message(action="list") exposing every
+    connected chat across every platform, not just WhatsApp).
+
+    Mirrors ``gateway/run.py::_should_skip_user_profile_for_source``'s core
+    identity comparison (the guard that keeps USER.md out of non-owner
+    chats) without needing a live ``GatewayRunner`` instance -- this only
+    needs the module-level home-channel config, so it can run from a plain
+    tool handler with no runner reference. Deliberately a call-time check
+    (read fresh via ``get_current_message_source()``), not a ``check_fn``
+    registration gate: ``check_fn`` results are cached up to 30s and are
+    NOT turn-scoped (see ``tools/registry.py::_check_fn_cached``), so
+    gating identity there would let one turn's verdict leak into a
+    different sender's turn within the same cache window.
+    """
+    if source is None:
+        return False
+    platform = getattr(source, "platform", None)
+    if platform is None:
+        return False
+
+    try:
+        from gateway.config import load_gateway_config
+        config = load_gateway_config()
+        home = config.get_home_channel(platform) if config else None
+    except Exception:
+        home = None
+    if not home or not home.chat_id:
+        return False
+
+    home_ids = {str(home.chat_id)}
+    source_values = {
+        str(getattr(source, "chat_id", "") or ""),
+        str(getattr(source, "user_id", "") or ""),
+        str(getattr(source, "chat_id_alt", "") or ""),
+        str(getattr(source, "user_id_alt", "") or ""),
+    }
+    source_values.discard("")
+
+    try:
+        from gateway.config import Platform
+        if platform == Platform.WHATSAPP:
+            from gateway.whatsapp_identity import expand_whatsapp_aliases
+            for value in list(home_ids):
+                home_ids |= expand_whatsapp_aliases(value)
+            for value in list(source_values):
+                source_values |= expand_whatsapp_aliases(value)
+    except Exception:
+        pass
+
+    return bool(home_ids & source_values)
+
+
+def set_reply_tool_gated_turn(active: bool) -> contextvars.Token:
+    """Mark whether the current turn is under tool-mode reply gating.
+
+    Bound once per inbound message from the turn source's resolved reply
+    decision; read by the send-message tool and post-turn block to know whether
+    the free-text tail is subject to the delivery ledger for this turn.
+    """
+    return _current_turn_reply_tool_gated.set(bool(active))
+
+
+def is_reply_tool_gated_turn() -> bool:
+    """True when the current turn is under tool-mode reply gating."""
+    return bool(_current_turn_reply_tool_gated.get())
+
+
+def reset_reply_tool_gated_turn(token: contextvars.Token) -> None:
+    """Restore the prior reply-tool-gated context."""
+    _current_turn_reply_tool_gated.reset(token)
+
+
+def set_turn_delivery_state(state: "TurnDeliveryState") -> contextvars.Token:
+    """Bind the per-turn delivery ledger shared across the follow-up chain."""
+    return _current_turn_delivery_state.set(state)
+
+
+def get_turn_delivery_state() -> Optional["TurnDeliveryState"]:
+    """Return the current turn's delivery ledger, or None outside a turn."""
+    return _current_turn_delivery_state.get()
+
+
+def reset_turn_delivery_state(token: contextvars.Token) -> None:
+    """Restore the prior turn delivery-state context."""
+    _current_turn_delivery_state.reset(token)
+
+
+def note_current_message_delivered() -> None:
+    """Record that the current turn delivered to its originating chat via a tool.
+
+    Increments the turn-scoped TurnDeliveryState (shared by identity across the
+    whole re-entrant follow-up chain) so the post-turn block and stream consumer
+    can dedup: a tool-driven send to the current chat means the free-text tail
+    must never also auto-deliver. Also bumps the legacy source-object counter
+    when a source is bound, for readers still consulting reply_gate_tool_sends.
+    No-op outside a gateway turn.
+    """
+    state = _current_turn_delivery_state.get()
+    if state is not None:
+        try:
+            state.tool_sends += 1
+        except Exception:
+            pass
+    src = _current_message_source.get()
+    if src is not None:
+        try:
+            src.reply_gate_tool_sends = int(getattr(src, "reply_gate_tool_sends", 0) or 0) + 1
+        except Exception:
+            pass
+
+
+def note_current_message_silent() -> None:
+    """Record that the current turn explicitly decided to stay silent.
+
+    Companion to :func:`note_current_message_delivered`: the two make "reply"
+    and "silent" symmetric first-class decisions rather than "silent" being the
+    mere absence of a send. An explicit silent decision closes the gate but is
+    NOT a delivery. Mirrors to the legacy source counter for back-compat.
+    No-op outside a gateway turn.
+    """
+    state = _current_turn_delivery_state.get()
+    if state is not None:
+        try:
+            state.decided_silent += 1
+        except Exception:
+            pass
+    src = _current_message_source.get()
+    if src is not None:
+        try:
+            src.reply_gate_decided_silent = int(getattr(src, "reply_gate_decided_silent", 0) or 0) + 1
+        except Exception:
+            pass
+
+
+@dataclass
+class CronSilenceState:
+    """Whether the currently-running cron agent explicitly decided silence.
+
+    Set by ``tools.cronjob_silent_tool.cronjob_silent_tool`` via
+    ``note_cron_silence_decided()``. Read by ``cron/scheduler.py`` after
+    ``agent.run_conversation()`` returns, in place of (never in addition
+    to) regex-matching the response text.
+    """
+
+    decided: bool = False
+    reason: str = ""
+
+
+_current_cron_silence_state: contextvars.ContextVar[Optional["CronSilenceState"]] = (
+    contextvars.ContextVar("current_cron_silence_state", default=None)
+)
+
+
+def set_cron_silence_state(state: "CronSilenceState") -> contextvars.Token:
+    """Bind a fresh CronSilenceState for the cron tick about to run.
+
+    Call once per ``run_conversation()`` invocation, before the agent
+    starts, mirroring ``set_turn_delivery_state``'s lifecycle.
+    """
+    return _current_cron_silence_state.set(state)
+
+
+def get_cron_silence_state() -> Optional["CronSilenceState"]:
+    """Return the current cron tick's CronSilenceState, or None outside one."""
+    return _current_cron_silence_state.get()
+
+
+def reset_cron_silence_state(token: contextvars.Token) -> None:
+    """Restore the prior cron-silence-state context."""
+    _current_cron_silence_state.reset(token)
+
+
+def note_cron_silence_decided(reason: str = "") -> bool:
+    """Record that the running cron agent explicitly chose to stay silent.
+
+    Returns False (and records nothing) when called outside a bound
+    CronSilenceState -- i.e. not actually inside a cron tick. Callers
+    (the ``cronjob_silent`` tool) surface that as a clear tool error rather
+    than silently no-op'ing, so a misuse is visible immediately instead of
+    behaving like a successful decision that never took effect.
+    """
+    state = _current_cron_silence_state.get()
+    if state is None:
+        return False
+    state.decided = True
+    state.reason = reason
+    return True

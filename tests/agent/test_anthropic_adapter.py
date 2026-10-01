@@ -1814,6 +1814,69 @@ def test_oauth_system_prompt_sanitizer_preserves_docs_url():
     assert kwargs["system"][-1]["text"].count("claude-code") == 3  # the caller's block, not the CC prefix
 
 
+def test_oauth_sanitizer_leaves_media_delivery_marker_untouched():
+    """RETIREMENT PIN — the OAuth system-prompt sanitizer must NOT rewrite ``MEDIA:`` to ``FILE:``.
+
+    History: a local fork patch (PR #23361, "anthropic OAuth/classifier hardening") once carried a
+    flat ``_OAUTH_SYSTEM_TEXT_REPLACEMENTS`` table with a ``("MEDIA:", "FILE:")`` entry, justified
+    generically as avoiding "literal classifier triggers" that misroute to extra-usage billing. That
+    entry was never shown to be an individually-required request-shape constraint: upstream absorbed
+    the genuine hardening (the ``mcp__`` tool-name encoding and the identity/slug rewrites, #48860)
+    and deliberately narrowed the table to product-name identity rewrites only — verified
+    byte-identical against merge-base in the -857 LOC adapter refactor (267cdbecf3).
+
+    ``MEDIA:`` is a delivery marker the base prompt teaches to the model (prompt_builder.py). The
+    ``FILE:`` spelling is fully handled on the RECOGNIZER side (has_media_marker / MEDIA_TAG_MARKERS
+    in gateway/platforms/base.py), so both spellings extract identically without a producer rewrite.
+    Reintroducing the OAuth producer rewrite would make the OAuth lane emit ``FILE:`` while the base
+    prompt says ``MEDIA:`` — a self-contradiction that historically needed a companion "do NOT
+    substitute FILE:" prompt guardrail (LOCAL_PATCHES.md #82368). This test makes that class of
+    regression impossible: a future port cannot silently reintroduce the rewrite.
+    """
+    sys_text = (
+        "You can send files natively: write MEDIA:/absolute/path/to/file.png in your response. "
+        "Delivery marker is MEDIA:."
+    )
+    kwargs = build_anthropic_kwargs(
+        model="claude-sonnet-4-20250514",
+        messages=[
+            {"role": "system", "content": sys_text},
+            {"role": "user", "content": "Hi"},
+        ],
+        tools=None,
+        max_tokens=4096,
+        reasoning_config=None,
+        is_oauth=True,
+    )
+    # The caller's block is the last one (the Claude Code CC prefix is prepended first).
+    caller_block = kwargs["system"][-1]["text"]
+    assert "MEDIA:/absolute/path/to/file.png" in caller_block  # delivery marker intact
+    assert "MEDIA:" in caller_block
+    assert "FILE:" not in caller_block  # never rewritten to the alias spelling
+
+
+def test_non_oauth_lane_leaves_media_marker_byte_identical():
+    """The non-OAuth (API-key / third-party) lane never touches the system prompt: no CC prefix, no
+    product-name sanitizing, and the ``MEDIA:`` delivery marker is returned byte-identical."""
+    sys_text = (
+        "You are the Hermes Agent by Nous Research. Send files with MEDIA:/absolute/path/to/file.png"
+    )
+    kwargs = build_anthropic_kwargs(
+        model="claude-sonnet-4-20250514",
+        messages=[
+            {"role": "system", "content": sys_text},
+            {"role": "user", "content": "Hi"},
+        ],
+        tools=None,
+        max_tokens=4096,
+        reasoning_config=None,
+        is_oauth=False,
+    )
+    # Non-OAuth lane returns the system prompt unchanged (plain string), including MEDIA: and the
+    # product names that the OAuth lane would have rewritten.
+    assert kwargs["system"] == sys_text
+
+
 def test_unsupported_inline_image_subtype_downgrades_to_text_for_anthropic(monkeypatch):
     """Sibling of the Responses guard: a data:image/svg+xml (or bmp/tiff) part forwarded verbatim as
     ``media_type`` 400s the Anthropic request on every replay — it must become a text placeholder

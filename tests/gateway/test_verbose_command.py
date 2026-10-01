@@ -61,8 +61,11 @@ class TestVerboseCommand:
         assert "tool_progress_command" in result
 
     @pytest.mark.asyncio
-    async def test_enabled_cycles_mode(self, tmp_path, monkeypatch):
-        """When enabled, /verbose cycles tool_progress mode per-platform."""
+    async def test_enabled_toggles_legacy_value_to_log(self, tmp_path, monkeypatch):
+        """When enabled, /verbose toggles the only surviving sink log<->off,
+        per-platform. Since #921 the in-chat progress bubble was removed, so the
+        legacy text modes (new/all/verbose) are inert and treated as ``off`` for
+        the toggle: a legacy ``all`` therefore flips to ``log``."""
         hermes_home = tmp_path / "hermes"
         hermes_home.mkdir()
         config_path = hermes_home / "config.yaml"
@@ -76,13 +79,40 @@ class TestVerboseCommand:
         runner = _make_runner()
         result = await runner._handle_verbose_command(_make_event())
 
-        # all -> verbose
-        assert "VERBOSE" in result
+        # legacy "all" (inert, treated as off) -> log
+        assert "LOG" in result
         assert "telegram" in result.lower()  # per-platform feedback
 
         # Verify config was saved to display.platforms.telegram
         saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
-        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "verbose"
+        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "log"
+
+    @pytest.mark.asyncio
+    async def test_enabled_toggles_log_back_to_off(self, tmp_path, monkeypatch):
+        """From ``log`` the toggle flips back to ``off`` (per-platform)."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "display:\n"
+            "  tool_progress_command: true\n"
+            "  platforms:\n"
+            "    telegram:\n"
+            "      tool_progress: log\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        result = await runner._handle_verbose_command(_make_event())
+
+        # log -> off
+        assert "OFF" in result
+        assert "telegram" in result.lower()
+
+        saved = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        assert saved["display"]["platforms"]["telegram"]["tool_progress"] == "off"
 
     @pytest.mark.asyncio
     async def test_quoted_false_keeps_command_disabled(self, tmp_path, monkeypatch):

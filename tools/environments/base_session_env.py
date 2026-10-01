@@ -9,6 +9,8 @@ import re
 import shlex
 from typing import Iterable
 
+from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+
 # Bridged per-session vars (gateway.session_context._VAR_MAP) are injected fresh onto every
 # command's process env and must NEVER persist in the shared bash snapshot: one long-lived
 # backend serves many sessions, so a snapshot carrying the FIRST session's HERMES_SESSION_ID
@@ -75,6 +77,11 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # Scope markers stamped onto a delegate_task child's / cron run's subprocess
         # env; a snapshot taken inside that window would re-assert them on every
         # later ``source`` and fence the PARENT session's kanban CLI (#90782).
+        # The delegated-child lineage marker (HERMES_DELEGATED_CHILD_CONTEXT ==
+        # DELEGATED_CHILD_ENV_MARKER) is included here on purpose: it is set for ONE
+        # command (a delegate_task child's subprocess) and must not survive into the
+        # shared snapshot, or that single child permanently marks the session as
+        # delegated for every later command (cafcb3b723 intent, already covered here).
         "HERMES_DELEGATED_CHILD_CONTEXT HERMES_CRON_SESSION "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "

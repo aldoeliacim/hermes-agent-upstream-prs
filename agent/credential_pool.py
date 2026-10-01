@@ -104,6 +104,16 @@ _TERMINAL_AUTH_REASONS = frozenset({
 # _TERMINAL_AUTH_REASONS (upstream 401 reasons) and handled explicitly.
 CREDENTIAL_PERSIST_FAILED_REASON = "credential_persist_failed"
 
+# Anthropic org-policy / entitlement 403 whose body reads "OAuth authentication
+# is currently not allowed for this organization". Unlike a transient 403 this
+# is a permanent administrative block on the account, so waiting out a TTL never
+# recovers it — mark the entry DEAD (as with a terminal 401) rather than letting
+# it re-enter rotation every hour and re-fail. Matched case-insensitively
+# against the normalized, lowercased error message.
+_ANTHROPIC_TERMINAL_403_MARKERS = (
+    "oauth authentication is currently not allowed for this organization",
+)
+
 # DEAD ``manual:*`` entries are pruned after this quiet window — they have no
 # singleton to re-seed from and the user can re-add via ``hermes auth add``.
 # Singleton-seeded entries (device_code, claude_code) are NOT pruned because
@@ -147,6 +157,16 @@ FAILURE_REASON_BILLING = "billing"
 # content-filter rejection, which leaves the credential healthy. Unverified
 # billing gets the short transient cooldown; genuine depletion re-latches.
 FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
+
+# Provider error REASONS that mean a quota wall (the plan's usage window is spent), not a
+# transient throttle: the key cannot succeed again before the recorded reset. Single source
+# for the pool (persisted ``last_error_reason``) and the runtime's 429 classifier.
+USAGE_LIMIT_REASON_TOKENS = ("usage_limit_reached", "gousagelimit")
+
+
+def _is_usage_limit_reason(reason: Optional[str]) -> bool:
+    text = str(reason or "").lower()
+    return any(token in text for token in USAGE_LIMIT_REASON_TOKENS)
 
 # Throttle window for the "no available entries" INFO line. Selection runs on
 # every model call; on Windows several processes share one rotating log behind
@@ -1163,6 +1183,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         reason = raw_reason.strip().lower() if isinstance(raw_reason, str) else ""
         if reason == CREDENTIAL_PERSIST_FAILED_REASON:
             return True
+        if self.provider == "anthropic" and status_code == 403:
+            message = str(normalized_error.get("message") or "").strip().lower()
+            if any(marker in message for marker in _ANTHROPIC_TERMINAL_403_MARKERS):
+                return True
         return status_code == 401 and reason in _TERMINAL_AUTH_REASONS
 
     def _mark_exhausted(
@@ -2088,16 +2112,81 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         self._last_no_entries_log_at = now
         logger.info("credential pool: no available entries (all exhausted or empty)")
 
+    def _last_resort_entry(
+        self, *, exclude_api_key: Optional[str] = None
+    ) -> Optional[PooledCredential]:
+        """Pick the least-bad EXHAUSTED entry that still carries a real token.
+
+        When every entry is in exhaustion cooldown, returning ``None`` makes the
+        caller build a **keyless** client (``Authorization: Bearer None``). A
+        keyless request doesn't fail cleanly — providers answer with a generic,
+        often *misleading* error (e.g. Anthropic's "third-party apps now draw
+        from your extra usage" 400), which the failover classifier then re-marks
+        as exhausted on a bogus signal. That is a self-perpetuating death-loop:
+        keyless request -> fake error -> re-exhaust -> keyless request, and the
+        surface goes fully dead with no reply (the 2026-06-16 desktop outage).
+
+        Sending the REAL token one more time is strictly better: either it now
+        succeeds (the cooldown was conservative / upstream recovered), or it
+        returns an ACCURATE 429/400 carrying a real ``reset_at`` so backoff is
+        truthful. We never invent capacity — we just refuse to send ``None``.
+
+        Only entries with a non-empty ``runtime_api_key`` qualify. Prefer the
+        entry whose cooldown elapses soonest, so we retry the one most likely to
+        be live.
+
+        ``exclude_api_key`` skips every entry wrapping that key. Rotation passes
+        the key that JUST failed: retrying a credential we know is depleted is
+        not a "last resort", it re-arms the same non-convergent rotation the
+        sibling-marking exists to break. BILLING exhaustion, a 402, an auth
+        failure (401) and a usage-limit quota wall are terminal until their
+        reset for the same reason and are excluded too: re-sending a key the
+        provider rejected, or whose plan window is spent, cannot recover, and
+        the caller must reach ``None`` and surface the real error (the pool
+        cooldown message names the reset time, #56810). The death-loop this
+        guards against is the *keyless* request after a transient throttle, not
+        an honest "no credential available".
+        """
+        candidates = [
+            e for e in self._entries
+            if e.last_status == STATUS_EXHAUSTED and e.runtime_api_key
+            and not (exclude_api_key and e.runtime_api_key == exclude_api_key)
+            and (e.extra or {}).get("failure_reason") != FAILURE_REASON_BILLING
+            and e.last_error_code not in (401, 402)
+            and not _is_usage_limit_reason(e.last_error_reason)
+        ]
+        if not candidates:
+            return None
+        # Soonest reset first; entries with no known reset_at sort last.
+        candidates.sort(key=lambda e: _exhausted_until(e) or float("inf"))
+        return candidates[0]
+
     def _select_unlocked(
         self, *, refresh: bool = True, count: bool = True, model: Optional[str] = None,
+        exclude_api_key: Optional[str] = None,
     ) -> Tuple[Optional[PooledCredential], List[PooledCredential]]:
         """Select the best available entry; returns ``(entry, pending_refresh)``.
 
         ``count=False`` skips the ``request_count`` bump for selections that are
         not going to serve a request (a forced-refresh target lookup).
+
+        *exclude_api_key* is the runtime key that just failed terminally; the
+        last-resort fallback below never re-hands it when another exhausted
+        entry with a distinct real token exists.
         """
         available, pending_refresh = self._available_entries(clear_expired=True, refresh=refresh, model=model)
         if not available:
+            last_resort = self._last_resort_entry(exclude_api_key=exclude_api_key)
+            if last_resort is not None:
+                self._current_id = last_resort.id
+                logger.warning(
+                    "credential pool: all entries exhausted — using last-resort "
+                    "entry %s with its real token rather than returning no "
+                    "credential (avoids a keyless 'Bearer None' request that "
+                    "would loop on a misleading provider error)",
+                    last_resort.label or last_resort.id[:8],
+                )
+                return last_resort, pending_refresh
             self._current_id = None
             self._log_no_available_entries()
             return None, pending_refresh
@@ -2112,11 +2201,15 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             entry = min(available, key=lambda e: e.request_count)
         else:
             entry = available[0]
-        # Count the selection under every strategy. The counter is ``least_used``'s
-        # baseline and reaches auth.json on the next persist (exhaustion, rotation,
-        # refresh); it used to move only while ``least_used`` was active.
+        # Count the selection under every strategy. ``least_used`` must persist
+        # immediately: otherwise another process (or a restart) sees the old count
+        # and repeatedly selects the same credential, defeating the strategy.
         if count:
-            entry = self._adopt(entry, persist=False, request_count=entry.request_count + 1)
+            entry = self._adopt(
+                entry,
+                persist=self._strategy == STRATEGY_LEAST_USED,
+                request_count=entry.request_count + 1,
+            )
         if self._strategy == STRATEGY_ROUND_ROBIN and len(available) > 1:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
@@ -2278,7 +2371,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             else:
                 logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
             self._current_id = None
-            next_entry, _pending = self._select_unlocked(refresh=False)
+            next_entry, _pending = self._select_unlocked(
+                refresh=False, exclude_api_key=failed_runtime_key
+            )
             if next_entry is not None and next_entry.id == entry.id:
                 # No-recovery guard (#97315): selection handed back the very entry that was
                 # just marked (the auth-store sync adopted fresher tokens, or a quota probe

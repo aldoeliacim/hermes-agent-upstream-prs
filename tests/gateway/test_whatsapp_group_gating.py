@@ -227,6 +227,28 @@ def test_status_broadcast_chats_are_always_dropped():
     assert adapter._should_process_message(newsletter_msg) is False
 
 
+def test_status_pseudo_chat_under_s_whatsapp_net_is_dropped():
+    """Baileys also surfaces the Status pseudo-chat under the @s.whatsapp.net
+    domain spelling (``status@s.whatsapp.net``), not just ``status@broadcast``.
+    Without recognizing it, a Story update arriving under that JID slips past the
+    broadcast gate and is treated as a regular DM on the open-DM path — replying
+    spams the contact's Story feed.
+    """
+    adapter = _make_adapter(dm_policy="open")
+
+    status_msg = _dm_message(
+        body="[image received]",
+        chatId="status@s.whatsapp.net",
+        senderId="34612345678@s.whatsapp.net",
+    )
+    assert adapter._should_process_message(status_msg) is False
+    # The predicate itself is case-insensitive and covers the new spelling.
+    assert adapter._is_broadcast_chat("status@s.whatsapp.net") is True
+    assert adapter._is_broadcast_chat("STATUS@S.WHATSAPP.NET") is True
+    # Sanity: a normal DM under @s.whatsapp.net is NOT treated as broadcast.
+    assert adapter._is_broadcast_chat("34612345678@s.whatsapp.net") is False
+
+
 def test_broadcast_filter_runs_before_allowlist():
     """A status@broadcast message from an allowlisted sender still drops —
     we never want to reply to Stories, even from authorized contacts.

@@ -249,3 +249,42 @@ def test_seeds_do_not_collide_across_workspaces():
         "identical chat ids in different workspaces seeded the SAME session "
         "key — cross-workspace transcript bleed"
     )
+
+
+def test_origin_less_telegram_private_topic_seeds_dm_key():
+    """Live incident (2026-09-29, job 0cf222c018ba): an origin-less job fell back to the Telegram
+    home channel — a PRIVATE chat with topics. The seed was typed ``group`` because DM inference
+    only knew Slack's ``D`` prefix, so the user's topic reply built ``…:dm:<id>:<thread>`` and ran
+    without the brief it was answering (the agent answered a different conversation)."""
+    from cron.scheduler_delivery import _chat_id_is_dm
+
+    assert _chat_id_is_dm("telegram", "938650296") is True
+    store = MagicMock()
+    adapter = MagicMock()
+    adapter._session_store = store
+    with patch("gateway.mirror.mirror_to_session", return_value=True):
+        _seed_cron_thread_session(
+            {"id": "j9", "name": "monitor"}, adapter, "telegram", "938650296", "58567", "alert",
+            is_dm=_chat_id_is_dm("telegram", "938650296"),
+        )
+    reply_source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="938650296", chat_type="dm", user_id="938650296",
+        thread_id="58567",
+    )
+    assert build_session_key(_seeded_source(store)) == build_session_key(reply_source)
+
+
+def test_chat_id_dm_inference_never_calls_a_group_a_dm():
+    """A group misread as DM would drop user isolation — the leak direction. Group shapes and
+    unknown platforms must stay non-DM."""
+    from cron.scheduler_delivery import _chat_id_is_dm
+
+    assert _chat_id_is_dm("telegram", "-1001234567") is False
+    assert _chat_id_is_dm("telegram", "-4567") is False
+    assert _chat_id_is_dm("whatsapp", "120363400236163214@g.us") is False
+    assert _chat_id_is_dm("whatsapp", "5215551000001@s.whatsapp.net") is True
+    assert _chat_id_is_dm("whatsapp", "96370627199010@lid") is True
+    assert _chat_id_is_dm("slack", "C0123") is False
+    assert _chat_id_is_dm("slack", "D0123") is True
+    assert _chat_id_is_dm("discord", "123456") is False
+    assert _chat_id_is_dm("telegram", "") is False

@@ -608,7 +608,11 @@ def test_wire_guard_scopes_retention_drop_by_real_endpoint(
 
 
 def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):
-    """The event-driven path tolerates streams that end without a terminal frame.
+    """The event-driven path RETURNS collected items when a stream ends without a terminal frame.
+
+    What it must NOT do is call that success: a transport EOF is not a provider
+    ``response.completed``, so the partial item comes back with status ``incomplete`` and
+    cannot be finalized as a whole answer.
 
     Previously the SDK's ``responses.stream(...)`` helper raised
     ``RuntimeError("Didn't receive a `response.completed` event.")`` which the
@@ -639,7 +643,7 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
 
     response = agent._run_codex_stream(_codex_request_kwargs())
     assert calls["create"] == 1
-    assert response.status == "completed"
+    assert response.status == "incomplete"
     assert response.output == [output_item]
 
 
@@ -2402,6 +2406,38 @@ def test_run_codex_stream_retired_request_raises_instead_of_partial_final(monkey
 
     with pytest.raises(TimeoutError, match="retired"):
         agent._run_codex_stream(_codex_request_kwargs())
+
+
+    """No token installed (non-watchdog callers) still TOLERATES a terminal-less stream.
+
+    Tolerance is about delivery, not success: the collected item still comes back, but the
+    status stays ``incomplete`` and cannot authorize normal finalization.
+
+    ``_active_codex_stream_request_token`` is only set by
+    ``interruptible_api_call``. Auxiliary callers (compression summaries,
+    title generation) drive ``_run_codex_stream`` directly with no token and
+    must keep tolerating a stream that ends without a terminal frame.
+    """
+    agent = _build_agent(monkeypatch)
+    agent._active_codex_stream_request_token = None
+    output_item = SimpleNamespace(
+        type="message",
+        status="completed",
+        content=[SimpleNamespace(type="output_text", text="no terminal frame")],
+    )
+
+    def _fake_create(**kwargs):
+        return _FakeCreateStream([
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.output_item.done", item=output_item),
+        ])
+
+    agent.client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert response.status == "incomplete"
+    assert response.output == [output_item]
+
 
 
 def test_run_codex_stream_retired_request_stops_firing_callbacks(monkeypatch):

@@ -28,6 +28,10 @@ _NON_MIRROR_DIRS = {
     "fakes", "fixtures", "honcho_plugin", "install", "integration", "manual",
     "monitoring", "openviking_plugin", "perf_guards", "scripts", "secret_sources",
     "security", "skills", "verify", "website", "computer_use", "hermes_state",
+    # Local fork: tests for deployment-side scripts that live OUTSIDE this repo
+    # (~/.hermes/scripts/*, e.g. the Mnemosyne KG review gate), so there is no
+    # source package here to mirror. Enrolled by the patch-stack validator.
+    "local",
 }
 
 # Root-level modules whose tests sit directly in tests/ (no package to mirror).

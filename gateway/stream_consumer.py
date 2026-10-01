@@ -118,7 +118,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
-        run_still_current: Optional[Callable[[], bool]] = None):
+        run_still_current: Optional[Callable[[], bool]] = None,
+        delivery_decided: Optional[Callable[[], bool]] = None):
         self.adapter = adapter
         self.chat_id = chat_id
         self.cfg = config or StreamConsumerConfig()
@@ -131,6 +132,16 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._turn_id = str(uuid.uuid4())  # keys send_stream_frame() per concurrent consumer
         # Returns False after /new or /stop; run() then abandons the stream.
         self._run_still_current = run_still_current or (lambda: True)
+        # Reply-gate delivery predicate: once the turn has decided its delivery
+        # outcome (a current-chat send_message closed the gate, or explicit
+        # silence did), any text the model streams afterward is a trailing
+        # duplicate. Streaming is a real delivery path, so it consults the same
+        # predicate the post-turn block does; the two cannot disagree. Default
+        # keeps non-gateway callers (CLI, tests) streaming unchanged.
+        self._delivery_decided = delivery_decided or (lambda: False)
+        # Latch: once the gate is observed closed it stays closed for this
+        # consumer, so a mid-stream decision can't reopen on a later tick.
+        self._delivery_gate_closed = False
         # Whether this consumer is fed the final reply's stream deltas. A consumer built only to
         # relay interim commentary (text streaming off, ``display.interim_assistant_messages`` on)
         # never receives the final's deltas, so the duplicate-risk diagnostic in
@@ -244,9 +255,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return self._use_native_streaming
 
     def on_tool_progress(self, line: str) -> None:
-        """Thread-safe: overlay a tool-progress line in the native bubble until the next delta."""
-        if line:
-            self._queue.put((_TOOL_PROGRESS, line))
+        """Removed lane (#921): the in-stream tool-progress overlay was part of the edited/rewritten
+        progress-acknowledgement machinery and was deleted. This is now a no-op so no progress text
+        can ever reach the native stream bubble; kept as a stable no-op for any duck-typed caller."""
+        return
 
     def _compose_frame_content(self) -> str:
         """Native frame content: text, with any tool-progress lines below a rule."""
@@ -550,6 +562,17 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 # Session reset (/new, /stop): abandon rather than deliver stale deltas.
                 if not self._run_still_current():
                     await self._abandon_native_stream()
+                    return
+                # Reply-gate: the turn already decided its delivery (a current-chat
+                # send closed the gate, or explicit silence did). Anything the
+                # model streams now is a trailing duplicate — retract any partial
+                # bubble and stop, leaving delivery flags false so the post-turn
+                # block sees the stream delivered nothing. Latched so a later tick
+                # can't reopen it.
+                if not self._delivery_gate_closed and self._delivery_decided():
+                    self._delivery_gate_closed = True
+                if self._delivery_gate_closed:
+                    await self._suppress_silence_marker()
                     return
                 tick = self._drain_queue()
 

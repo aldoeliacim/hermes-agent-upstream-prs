@@ -143,6 +143,16 @@ def assemble_api_request(
         agent, api_messages, messages, _sel_incoming, logger=request_logger
     )
 
+    # Unfinished-todo reconciliation rides the REQUEST COPY only. Neither the superseded
+    # candidate answer nor the internal advisory enters session history, incremental
+    # flushes, compaction or a later turn. Appending here leaves the cached conversation
+    # prefix and tool schemas untouched and preserves assistant/user alternation.
+    _todo_pair = getattr(agent, "_todo_reconciliation_messages", None)
+    if _todo_pair:
+        from agent.conversation_loop import _clone_message_for_send
+
+        api_messages.extend(_clone_message_for_send(m) for m in _todo_pair)
+
     # Runs unconditionally (not gated on context_compressor) so orphaned tool
     # results from session loading or manual message edits are always caught.
     api_messages = agent._sanitize_api_messages(api_messages)

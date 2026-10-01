@@ -18,7 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 
@@ -56,8 +56,22 @@ def _make_runner():
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
+    # Configure a home channel matching _make_source()'s chat_id so the owner
+    # gate on the /approve resolve path recognizes this fake session as the
+    # home/owner session, matching a real single-owner deployment. Without any
+    # configured home channel, that gate conservatively (and correctly, by
+    # design) treats EVERY source as a non-owner and fails closed — which would
+    # deny every approval here, masking the plaintext-routing path under test.
     runner.config = GatewayConfig(
-        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")}
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="test-token",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM, chat_id="c1", name="test-home",
+                ),
+            )
+        }
     )
     adapter = MagicMock()
     adapter.send = AsyncMock()
@@ -134,3 +148,62 @@ def test_no_pending_approval_does_not_consume_conversational_yes():
     _clear_approval_state()
 
 
+# ── B2: non-owner /approve is fail-closed (denied, never executed) ───────────
+
+def _make_non_owner_source() -> SessionSource:
+    """A routed contact whose chat_id does NOT match the configured home."""
+    return SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="contact-99",
+        chat_id="contact-99",
+        user_name="contact",
+        chat_type="dm",
+    )
+
+
+def _make_non_owner_event(text: str) -> MessageEvent:
+    return MessageEvent(
+        text=text, message_type=MessageType.TEXT,
+        source=_make_non_owner_source(), message_id="mX",
+    )
+
+
+def test_non_owner_approve_is_denied_and_auto_denies_pending():
+    """A /approve from a non-owner contact must NOT authorize the command.
+    It fails closed: the pending approval is auto-DENIED and the caller is told
+    there is nothing to approve — the dangerous command never runs."""
+    _clear_approval_state()
+    runner, _ = _make_runner()  # home_channel chat_id = "c1"
+
+    # A blocking approval sits on the NON-OWNER's session key.
+    from tools.approval import _gateway_queues, has_blocking_approval
+    from tools.approval_gateway_wait import _ApprovalEntry
+
+    contact_source = _make_non_owner_source()
+    contact_key = runner._session_key_for_source(contact_source)
+    entry = _ApprovalEntry({"command": "rm -rf /tmp/test"})
+    _gateway_queues.setdefault(contact_key, []).append(entry)
+    assert has_blocking_approval(contact_key)
+
+    reply = asyncio.run(runner._handle_approve_command(_make_non_owner_event("approve")))
+
+    # Fail closed: reported as "nothing to approve" and the pending entry denied.
+    from agent.i18n import t
+    assert reply == t("gateway.approve.no_pending")
+    assert entry.event.is_set()
+    assert entry.result == "deny"
+    _clear_approval_state()
+
+
+def test_owner_approve_still_resolves():
+    """The owner (source matching the configured home) can still approve."""
+    _clear_approval_state()
+    runner, _ = _make_runner()  # home_channel chat_id = "c1" == _make_source() chat_id
+    session_key, entry = _register_blocking_approval(runner)
+
+    reply = asyncio.run(runner._handle_approve_command(_make_event("approve")))
+
+    assert entry.event.is_set()
+    assert entry.result == "once"
+    assert reply is not None
+    _clear_approval_state()

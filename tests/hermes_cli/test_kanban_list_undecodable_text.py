@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,14 @@ def test_respawn_guard_survives_blob_comment_body_and_failure_error(board):
         kbd.dispatch_once(conn, dry_run=True)
 
         with kb.write_txn(conn):
+            # A fresh DATED failure: the local layer bounds blocker_auth by the latest
+            # finished run's age (an undated deferral could park the card forever).
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO task_runs(task_id,status,outcome,started_at,ended_at) "
+                "VALUES (?,'failed','blocked',?,?)",
+                (tid, now - 20, now - 10),
+            )
             conn.execute(
                 "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
                 (sqlite3.Binary(b"429 quota exceeded"), tid),

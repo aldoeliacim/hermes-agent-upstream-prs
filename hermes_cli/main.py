@@ -1861,8 +1861,15 @@ def cmd_chat(args):
 
     try:
         from cli import main as cli_main
+        from gateway.session_context import local_cli_scope
 
-        cli_main(**kwargs)
+        # The classic CLI binds a typed local scope for its whole lifetime: that
+        # is what marks "this is the operator's own terminal", independently of
+        # --source and of a cron worker engaging the host latch. Process
+        # ownership grants same-profile administrative access on this mark, so
+        # without the binding the CLI cannot reach its own background processes.
+        with local_cli_scope():
+            cli_main(**kwargs)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -3376,6 +3383,8 @@ def _build_cli_parser():
     chat_parser.set_defaults(func=cmd_chat)
 
     build_model_parser(subparsers, cmd_model=cmd_model)
+    from hermes_cli.subcommands.sender_model import build_sender_model_parser
+    build_sender_model_parser(subparsers)
     build_moa_parser(subparsers)
     build_fallback_parser(subparsers)
     build_worktree_parser(subparsers)

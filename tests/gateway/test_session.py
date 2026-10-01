@@ -1533,3 +1533,107 @@ class TestGatewayRoutingTable:
         restarted._db.close()
 
 
+class TestSharedAudienceConfidentialityGuard:
+    """A shared, multi-person chat must carry the confidentiality guard; DMs must not.
+
+    Ported from d295ac9515 (gateway/session.py shared-audience guard): owner-only
+    operational detail must never default to a chat read by every participant just
+    because the triggering command arrived there.
+    """
+
+    def _ctx(self, *, chat_type="group", platform=Platform.TELEGRAM,
+             thread_id=None, shared=False):
+        from gateway.session import SessionContext
+        source = SessionSource(
+            platform=platform,
+            chat_id="120363000000000000@g.us",
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_name="alice",
+        )
+        return SessionContext(
+            source=source,
+            connected_platforms=[platform],
+            home_channels={},
+            shared_multi_user_session=shared,
+        )
+
+    def test_group_chat_gets_confidentiality_guard(self):
+        prompt = build_session_context_prompt(self._ctx(chat_type="group"))
+        assert "Shared audience — confidentiality:" in prompt
+
+    def test_channel_chat_gets_confidentiality_guard(self):
+        prompt = build_session_context_prompt(self._ctx(chat_type="channel"))
+        assert "Shared audience — confidentiality:" in prompt
+
+    def test_thread_gets_confidentiality_guard(self):
+        prompt = build_session_context_prompt(
+            self._ctx(chat_type="thread", thread_id="t1")
+        )
+        assert "Shared audience — confidentiality:" in prompt
+
+    def test_shared_multi_user_flag_triggers_guard(self):
+        prompt = build_session_context_prompt(
+            self._ctx(chat_type="dm", shared=True)
+        )
+        # A DM is never a shared audience even if flagged, per the guard.
+        assert "Shared audience — confidentiality:" not in prompt
+
+    def test_dm_has_no_confidentiality_guard(self):
+        prompt = build_session_context_prompt(self._ctx(chat_type="dm"))
+        assert "Shared audience — confidentiality:" not in prompt
+
+    def test_local_platform_never_gets_guard(self):
+        prompt = build_session_context_prompt(
+            self._ctx(chat_type="group", platform=Platform.LOCAL)
+        )
+        assert "Shared audience — confidentiality:" not in prompt
+
+
+class TestFreshSessionReplyGateAnchor:
+    """Shared audiences get a cache-stable first-turn silence anchor; DMs do not."""
+
+    _MARKER = "First-message reply gate"
+
+    @staticmethod
+    def _prompt(source):
+        config = GatewayConfig(
+            platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake")}
+        )
+        return build_session_context_prompt(build_session_context(source, config))
+
+    @pytest.mark.parametrize("chat_type,thread_id", [
+        ("group", None),
+        ("channel", None),
+        ("group", "17585"),
+    ])
+    def test_shared_audience_gets_anchor(self, chat_type, thread_id):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_name="Shared chat",
+            chat_type=chat_type,
+            thread_id=thread_id,
+            user_name="Alice",
+        )
+        prompt = self._prompt(source)
+        assert self._MARKER in prompt
+        assert "default is SILENCE" in prompt
+
+    @pytest.mark.parametrize("source", [
+        SessionSource(platform=Platform.TELEGRAM, chat_id="111", chat_type="dm"),
+        SessionSource(platform=Platform.LOCAL, chat_id="cli", chat_type="dm"),
+    ])
+    def test_private_or_local_session_is_exempt(self, source):
+        assert self._MARKER not in self._prompt(source)
+
+    def test_anchor_is_cache_stable(self):
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100222",
+            chat_type="group",
+            user_name="Alice",
+        )
+        assert self._prompt(source) == self._prompt(source)
+
+

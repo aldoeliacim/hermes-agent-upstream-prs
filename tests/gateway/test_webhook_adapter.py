@@ -370,6 +370,53 @@ class TestEventFilter:
             assert resp.status == 202
 
 
+    @pytest.mark.asyncio
+    async def test_linear_event_header_matches_events_allowlist(self):
+        """A Linear webhook's Linear-Event header is recognized by the events allowlist."""
+        routes = {
+            "lin": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["Issue"],
+                "prompt": "Issue: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/lin",
+                json={"action": "create"},
+                headers={"Linear-Event": "Issue"},
+            )
+            assert resp.status == 202
+
+    @pytest.mark.asyncio
+    async def test_linear_event_header_rejected_when_not_allowed(self):
+        """A Linear-Event value outside the allowlist is ignored (not routed)."""
+        routes = {
+            "lin": {
+                "secret": _INSECURE_NO_AUTH,
+                "events": ["Issue"],
+                "prompt": "Issue: {action}",
+            }
+        }
+        adapter = _make_adapter(routes=routes)
+        adapter.handle_message = AsyncMock()
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/webhooks/lin",
+                json={"action": "create"},
+                headers={"Linear-Event": "Comment"},
+            )
+            body = await resp.json()
+            assert body.get("status") == "ignored"
+            assert body.get("event") == "Comment"
+
+
 # ===================================================================
 # Payload filters
 # ===================================================================

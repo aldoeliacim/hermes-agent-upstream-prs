@@ -45,6 +45,24 @@ import {
   console.log('  ✓ inbound read receipts preserve the original group message key');
 }
 
+// -- DM read receipts never carry participant --------------------------------
+// The adapter posts back the key it was handed, which may predate a fix or come
+// from a LID-addressed DM. A participant on a DM receipt makes Baileys emit a
+// group-shaped <receipt> that WhatsApp drops, so /read strips it at the edge.
+for (const remoteJid of ['15551234567@s.whatsapp.net', '90000000000001@lid']) {
+  const dmKey = {
+    id: 'incoming-dm-1',
+    remoteJid,
+    participant: '15550001111@s.whatsapp.net',
+    fromMe: false,
+  };
+  const [receiptKey] = inboundReadReceiptKeys({ key: dmKey, enabled: true });
+  assert.deepEqual(receiptKey, { id: 'incoming-dm-1', remoteJid, fromMe: false });
+  assert.equal('participant' in receiptKey, false);
+  assert.equal(dmKey.participant, '15550001111@s.whatsapp.net', 'caller key is not mutated');
+}
+console.log('  ✓ DM read receipts drop participant (phone and LID addressing)');
+
 // -- quoted outbound text -------------------------------------------------
 {
   const store = createBoundedMessageStore(2);
@@ -131,7 +149,9 @@ import {
   assert.deepEqual(event.readReceiptKey, {
     id: 'incoming-1',
     remoteJid: '15551234567@s.whatsapp.net',
-    participant: '15550001111@s.whatsapp.net',
+    // A DM receipt key must NOT carry `participant`: Baileys' sendReceipt copies
+    // it onto the <receipt> node, the node looks group-shaped, and WhatsApp
+    // silently drops it (no blue ticks, while /read still reports marked:true).
     fromMe: false,
   });
   assert.equal(event.hasQuotedMessage, true);

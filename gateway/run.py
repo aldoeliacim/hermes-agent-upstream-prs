@@ -569,6 +569,19 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
     return redact_for_egress(text)
 
 
+def _redact_secrets_for_non_owner(text: str) -> str:
+    """Scrub credentials/tokens/keys from an outbound message bound for a proven NON-OWNER silo.
+
+    The caller must already have confirmed the destination leaves the owner's private DM
+    (``_destination_requires_privacy_guard``). Names, tone, and FILE:/MEDIA: delivery paths are
+    intentionally left untouched: the owner-identity defense is prompt-side (skip_user_profile),
+    and a blanket name rewrite reads as robotic and mangles delivery paths.
+    """
+    if not text:
+        return text
+    return _redact_gateway_user_facing_secrets(str(text))
+
+
 def _redact_approval_command(cmd: "str | None") -> str:
     """Redact credentials from a command before it goes into an approval prompt.
 
@@ -704,6 +717,14 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     from agent.message_sanitization import _sanitize_surrogates
 
     text = _sanitize_surrogates(str(text))
+    # Defense in depth: the agent loop retries internal handoffs, but gateway
+    # delivery also receives legacy/plugin results. A retry must never be the
+    # only boundary between a private context summary and a chat recipient.
+    from agent.turn_final_response import internal_artifact_kind
+
+    if internal_artifact_kind(text) == "summary_envelope":
+        logger.error("Internal summary handoff suppressed at gateway chat delivery")
+        return ""
 
     # Some OpenAI-compatible providers leak their exact end-of-sequence control token into
     # ``final_response`` even though finish_reason is already ``stop``.  It is transport metadata,
@@ -1047,16 +1068,12 @@ def build_resume_recovery_note(
     if message:
         resume_guidance = (
             "Address the user's NEW message below FIRST and focus on what the user is asking now.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
+        tail_guidance = _INTERRUPTED_WORK_GUIDANCE
     elif interactive:
         resume_guidance = (
             "Report to the user that the session was restored "
             "successfully and ask what they would like to do next.")
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any unfinished work from the conversation history."
-        )
+        tail_guidance = _INTERRUPTED_WORK_WAIT_GUIDANCE
     else:
         resume_guidance = (
             "No user is present on this non-interactive platform, "
@@ -1256,6 +1273,16 @@ def _build_gateway_agent_history(
         if not role or role in {"session_meta", "system"}:
             continue
 
+        # Reply-gate scratch: an assistant free-text tail suppressed this turn
+        # because a current-chat send already delivered the reply. It is kept in
+        # the transcript for display only (display_kind="reply_gate_scratch")
+        # but must never re-enter the API replay — replaying it would let a
+        # later turn treat the suppressed narration as real conversation and
+        # re-deliver it. Assistant rows only; the tag is presentation metadata a
+        # user/tool row could carry defensively without meaning suppression.
+        if role == "assistant" and msg.get("display_kind") == "reply_gate_scratch":
+            continue
+
         content = msg.get("content")
         if separate_observed_context and msg.get("observed") and role == "user" and content:
             if inject_timestamps and isinstance(content, str):
@@ -1407,9 +1434,12 @@ def _strip_auto_continue_noise(content: Any) -> Any:
 _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
 
 
-# Extension-anchored MEDIA: matcher (mirrors the dispatch site); a bare ``MEDIA:`` in prose never auto-appends.
+# Extension-anchored MEDIA:/FILE: matcher (mirrors the dispatch site); a bare marker in prose never auto-appends.
+# The (?:MEDIA|FILE) spellings are inlined (not built from ``_MEDIA_MARKER_ALTERNATION``) because this
+# module-level ``re.compile`` runs before run.py's ``gateway.platforms.base`` import executes; the parity
+# suite (parametrised over ``MEDIA_TAG_MARKERS``) still fails loudly if a third spelling is ever added.
 _TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
+    r'(?:MEDIA|FILE):((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
     r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
     r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
     r'txt|csv|apk|ipa))',
@@ -1454,7 +1484,7 @@ def _collect_auto_append_media_tags(
         content = str(msg.get("content") or "")
         tool_name = tool_name_by_call_id.get(call_id)
         # image_generate emits a JSON path field, not a MEDIA: tag; extract it: deterministic delivery.
-        if tool_name == "image_generate" and "MEDIA:" not in content:
+        if tool_name == "image_generate" and not has_media_marker(content):
             try:
                 payload = json.loads(content)
             except Exception:
@@ -1468,7 +1498,7 @@ def _collect_auto_append_media_tags(
                         media_tags.append(f"MEDIA:{path}")
                         break
             continue
-        if "MEDIA:" not in content:
+        if not has_media_marker(content):
             continue
         for match in _TOOL_MEDIA_RE.finditer(content):
             path = match.group(1).strip().rstrip('",}')
@@ -1503,7 +1533,7 @@ def _collect_history_media_paths(agent_history: List[Dict[str, Any]]) -> set:
         if role not in ("assistant", "tool", "function"):
             continue
         content = str(msg.get("content", "") or "")
-        if "MEDIA:" in content:
+        if has_media_marker(content):
             _add_text_media_paths(content)
             continue
         if role == "assistant":
@@ -2198,7 +2228,17 @@ from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.run_startup import GatewayStartupMixin
 from gateway.run_watchers import GatewaySessionWatchersMixin
-from gateway.run_notifications import GatewayNotificationsMixin
+from gateway.run_common import (
+    _INTERRUPTED_WORK_GUIDANCE,
+    _INTERRUPTED_WORK_WAIT_GUIDANCE,
+    _build_interruption_system_note,
+    _build_tool_tail_system_note,
+    _resolve_resume_note_kind,
+)
+from gateway.run_notifications import (
+    GatewayNotificationsMixin,
+    _ABSORB_SILENTLY_INSTRUCTION,
+)
 from gateway.run_inbound import GatewayInboundMixin
 from gateway.run_goals import GatewayGoalsMixin
 from gateway.run_agent_cache import GatewayAgentCacheMixin
@@ -2208,6 +2248,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     _reply_anchor_for_event,
     _terminal_sentinel_start,
+    has_media_marker,
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.restart import (
@@ -3587,6 +3628,15 @@ class GatewayRunner(
         self._booted_from_restart: bool = False
         self._stop_task: Optional[asyncio.Task] = None
         self._restart_task: Optional[asyncio.Task] = None
+        # Isolation policy for native contact admission (gateway/isolated_routing.py).
+        # No policy => None, and every isolation gate downstream stays inert, so a
+        # deployment that has not opted in behaves exactly as before. The
+        # supervisor-owned sentinel `.isolated-agents-required` beside config.yaml
+        # makes a REMOVED or malformed policy fail closed at startup instead.
+        from gateway.isolated_routing import load_policy as _load_policy
+        self._isolated_policy = _load_policy(Path(get_hermes_home()) / "config.yaml")
+        self._isolated_runtime = None  # lazily bound, owned and closed by this root
+        self._isolated_stopped = False
         self._executor_lock = threading.Lock()
         self._executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         # Best-effort session housekeeping runs on its OWN pool; see _run_housekeeping_in_executor.

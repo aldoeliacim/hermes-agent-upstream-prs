@@ -17,11 +17,15 @@ from tools.send_message_senders import (
     _adapter_media_method, _error, _live_adapter, _media_caption_split, _plugin_standalone_sender,
     _registry_standalone_send, _resolve_slack_user_target, _sanitize_error_text, _send_bluebubbles,
     _send_matrix_via_adapter, _send_qqbot, _send_signal, _send_telegram, _send_weixin, _send_yuanbao)
-from tools.registry import tool_error
+from tools.registry import registry, tool_error
 
 # NOTE: ``send_message`` is intentionally NOT registered as an agent-callable model tool
-# (the agent must not fire cross-platform messages on its own); cron delivery, the
-# ``hermes send`` CLI, the kanban notifier and the opt-in MCP server import the helpers.
+# in the default configuration (the agent must not fire cross-platform messages on its
+# own); cron delivery, the ``hermes send`` CLI, the kanban notifier and the opt-in MCP
+# server import the helpers. It IS registered — at zero schema cost — for deployments
+# that explicitly opt into tool-gated delivery (``reply_gate_mode == "tool"``), where it
+# is the only sanctioned way to reply or to decide silence. See the gated registration
+# at the end of this module.
 
 
 def prepare_send_message_platforms() -> None:
@@ -36,8 +40,66 @@ def send_message_tool(args, **kw):
     if action == "list":
         return _handle_list()
     if action in ("react", "unreact"):
-        return _handle_react(args, remove=action == "unreact")
+        return _guarded_live_turn_call(_handle_react, args, remove=action == "unreact")
+    if action == "silent":
+        return _handle_silent(args)
     return _handle_send(args)
+
+
+def _guarded_live_turn_call(handler, args, **handler_kwargs):
+    """Refuse react/unreact from INSIDE a live gateway turn.
+
+    ``get_current_message_source()`` is set only while the gateway runs an actual
+    agent turn — never for CLI, cron, subagent or MCP-server callers. There is no
+    "current chat" concept for react/unreact here, and reacting to an arbitrary
+    cross-platform target from a live turn is exactly the autonomous capability
+    upstream removed this tool to prevent (#47856). The one legitimate live-turn
+    reaction need has a dedicated, already-scoped alternative.
+    """
+    from tools.approval import get_current_message_source
+    if get_current_message_source() is not None:
+        return tool_error(
+            "action='react'/'unreact' is not available inside a live "
+            "gateway turn -- reacting to an arbitrary cross-platform "
+            "target is exactly the autonomous capability upstream "
+            "removed this tool to prevent (#47856). To react to a "
+            "message in the CURRENT WhatsApp chat, use "
+            "whatsapp_action(action='react_message') instead."
+        )
+    return handler(args, **handler_kwargs)
+
+
+def _handle_silent(args):
+    """Record an EXPLICIT decision not to reply to the current gateway turn.
+
+    Only meaningful for ``target="current"``/omitted target during a live gateway turn —
+    this is the tool-gated reply-gate's silence counterpart to ``_handle_send``. Calling
+    it is how the model DECIDES to stay silent, as opposed to simply not calling
+    send_message at all (which the post-turn delivery block treats as a non-decision
+    requiring a nudge/retry rather than an accepted silence).
+
+    No platform I/O happens; this only records a turn-scoped decision on the shared
+    TurnDeliveryState (and the legacy source mirror). Note the consequence for the
+    dedup scan: it returns ``success: true`` because the CALL succeeded, though nothing
+    was delivered — see ``GatewayTurnMixin._transcript_has_current_chat_send``, which
+    must NOT read this as evidence of a send.
+    """
+    target = (args.get("target") or "current").strip()
+    if target not in ("", "current"):
+        return tool_error(
+            "action='silent' only applies to the current chat "
+            "(target='current' or omitted) — it declares 'I chose not to "
+            "reply to THIS turn', not silence toward an arbitrary target."
+        )
+    from tools.approval import get_current_message_source, note_current_message_silent
+    if get_current_message_source() is None:
+        return tool_error(
+            "action='silent' is only valid during a live gateway turn "
+            "(the chat this message came from). No inbound message source "
+            "is registered in this context."
+        )
+    note_current_message_silent()
+    return json.dumps({"success": True, "decision": "silent"})
 
 
 def _resolve_tool_target(target: str, *, pass_unresolved_references: bool = False):
@@ -53,6 +115,25 @@ def _resolve_tool_target(target: str, *, pass_unresolved_references: bool = Fals
 
 
 def _handle_list():
+    """Return the formatted list of available messaging targets.
+
+    Privacy gate: this discloses every connected chat/contact across every
+    platform. Inside a live gateway turn whose sender does not resolve to the
+    owner identity, that is exactly the "who else do you talk to" leak, so it is
+    refused the same way whatsapp_action refuses its own group/channel lookups.
+    Outside a live turn (CLI, cron, subagent) it stays unrestricted, mirroring
+    every other live-turn-only gate here (_guarded_live_turn_call precedent).
+    """
+    from tools.approval import get_current_message_source, is_owner_source
+    source = get_current_message_source()
+    if source is not None and not is_owner_source(source):
+        return json.dumps(_error(
+            "send_message(action='list') refused: this live turn's sender "
+            "does not resolve to the configured owner identity. Hal must "
+            "never disclose which other chats/contacts/groups he talks to "
+            "-- that information is only available to the owner's own "
+            "identity, or from outside a live gateway turn (CLI, cron)."
+        ))
     try:
         from gateway.channel_directory import format_directory_for_display
         return json.dumps({"targets": format_directory_for_display()})
@@ -201,8 +282,8 @@ def _handle_react(args, remove=False):
 
 def _handle_send(args):
     target, message = args.get("target", ""), args.get("message", "")
-    if not target or not message:
-        return tool_error("Both 'target' and 'message' are required when action='send'")
+    if not message:
+        return tool_error("'message' is required when action='send'")
     # Lone surrogates reach the outbound body via surrogateescape-decoded argv
     # (`hermes send` MESSAGE) and crash the UTF-8 marshal inside platform SDK
     # request bodies (feishu/lark, #113799). Every send_message caller (model tool
@@ -212,12 +293,73 @@ def _handle_send(args):
     # (``agent/turn_finalizer.py::finalize_turn``, ``gateway/run.py``).
     from agent.message_sanitization import _sanitize_surrogates
     message = _sanitize_surrogates(message)
-    platform_name, chat_id, thread_id, resolution_error = _resolve_tool_target(target)
-    if resolution_error:
-        return tool_error(resolution_error)
+    # Declared before the branch: only the target='current' path assigns it, so the
+    # delivery-recording gate below ("did this send resolve to the chat the turn came
+    # from?") must read a defined value on the explicit-target path.
+    _current_source = None
+    # target="current" (or an omitted target during a live turn) means "reply in the
+    # chat this turn came from" — resolved through the turn-scoped message source the
+    # gateway runner registers. Outside a gateway turn (CLI, cron, subagent) no source
+    # exists, so this is a clear tool error rather than a silent guess.
+    if target in ("", "current"):
+        from tools.approval import get_current_message_source
+        _current_source = get_current_message_source()
+        if _current_source is None:
+            return tool_error(
+                "target='current' is only valid during a live gateway turn "
+                "(the chat this message came from). No inbound message source is "
+                "registered in this context — specify an explicit target such as "
+                "'platform:chat_id' instead."
+            )
+        try:
+            platform_name = _current_source.platform.value
+        except Exception:
+            platform_name = str(getattr(_current_source, "platform", "")).strip().lower()
+        chat_id = str(getattr(_current_source, "chat_id", "") or "")
+        thread_id = getattr(_current_source, "thread_id", None) or None
+        if not platform_name or not chat_id:
+            return tool_error(
+                "target='current' could not resolve the originating chat "
+                "(missing platform/chat id on the message source)."
+            )
+    else:
+        # An explicit non-"current" target INSIDE a live gateway turn is the
+        # autonomous cross-platform capability upstream removed this tool to prevent
+        # (#47856). The tool-gate (reply_gate_mode) is a deployment-wide switch, not a
+        # per-turn one, so where it is configured the tool is schema-visible in EVERY
+        # turn — without this check the model could message an arbitrary target from a
+        # DM or a mention-gated group, not just decide the current chat's reply.
+        # Refuse outright; non-agent callers (hermes send CLI, cron, mcp_serve) never
+        # run inside a live turn, so they are unaffected.
+        from tools.approval import get_current_message_source
+        if get_current_message_source() is not None:
+            return tool_error(
+                "An explicit cross-platform target is not available inside a live "
+                "gateway turn -- only target='current' (reply to the chat this turn "
+                "came from) or action='silent' are permitted. Sending to an arbitrary "
+                "target is handled outside the agent loop (cron delivery, `hermes send` "
+                "CLI) by design (#47856)."
+            )
+        platform_name, chat_id, thread_id, resolution_error = _resolve_tool_target(target)
+        if resolution_error:
+            return tool_error(resolution_error)
     from tools.interrupt import is_interrupted
     if is_interrupted():
         return tool_error("Interrupted")
+
+    # The ordinary free-text final passes through gateway.delivery_judge, but a
+    # tool-gated turn can deliver directly with send_message(target="current")
+    # and suppress that final tail. A whole internal <summary> envelope is invalid
+    # for every recipient, including the owner, so screen it here BEFORE any adapter
+    # call — the deterministic privacy gate below covers the non-owner leak classes.
+    if _current_source is not None:
+        from agent.turn_final_response import internal_artifact_kind
+
+        if internal_artifact_kind(message):
+            return tool_error(
+                "Message withheld: internal artifacts (context summaries or tool-call "
+                "markup) cannot be delivered. Answer the latest user message directly."
+            )
     try:
         from gateway.config import load_gateway_config
         config = load_gateway_config()
@@ -233,6 +375,33 @@ def _handle_send(args):
     media_dropped: list = []
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files, dropped=media_dropped)
     mirror_text = cleaned_message.strip() or _describe_media_for_mirror(media_files)
+    # Deterministic privacy gate on the send_message(target="current") delivery seam
+    # (fail-closed). This is the ONE tool-driven egress that bypasses the post-turn
+    # final-response gate, so it must apply the same last-line-of-defence screen here.
+    # A positive match refuses the send WITHOUT naming the matched class — surfacing the
+    # mechanism would teach the model to phrase around it. (The async cross-user recall
+    # lane runs later, only for messages that pass this gate AND actually deliver.)
+    #
+    # Audience-scoped exactly like the final-response gate: the owner's own private DM
+    # is not screened (the owner is entitled to detail about their own infrastructure),
+    # groups/channels and non-owner DMs are. The owner check fails closed: if it errors,
+    # the screen runs.
+    if _current_source is not None and cleaned_message.strip():
+        try:
+            from gateway.owner_authority import source_is_owner
+
+            _owner_private_dm = (
+                getattr(_current_source, "chat_type", "dm") == "dm"
+                and source_is_owner(config, _current_source)
+            )
+        except Exception:
+            _owner_private_dm = False
+        from gateway.delivery_judge import deterministic_privacy_leak_reason
+        if not _owner_private_dm and deterministic_privacy_leak_reason(cleaned_message):
+            return tool_error(
+                "This message was withheld: it could not be delivered as written. "
+                "Rewrite it so it discloses only what belongs in THIS conversation."
+            )
     used_home_channel = not chat_id
     if used_home_channel:
         chat_id, err = _home_chat_id(config, platform, platform_name)
@@ -289,6 +458,36 @@ def _handle_send(args):
             result["media_dropped"] = media_dropped
         if isinstance(result, dict) and "error" in result:
             result["error"] = _sanitize_error_text(result["error"])
+        # Delivery accounting for the reply gate: a SUCCESSFUL send to the chat this
+        # live turn came from (target="current"/omitted) records a delivery decision on
+        # the turn-scoped ledger, so the post-turn block and stream consumer dedup the
+        # free-text tail. Read the FINAL success flag — the media_dropped path above
+        # flips it to a partial failure, and a partial delivery must not book a decision.
+        # No-op when no source is bound (explicit-target send outside a live turn).
+        if _current_source is not None and isinstance(result, dict) and result.get("success"):
+            from tools.approval import note_current_message_delivered
+            note_current_message_delivered()
+            # Async cross-user recall lane: the deterministic gate above already cleared this
+            # text (regex_verdict=False), so this closes only the recall gap — a leak the
+            # regex missed on a message that DID deliver. Off the hot path, best-effort, and
+            # it only ever logs an audit record (never surfaces the mechanism to the model).
+            if cleaned_message.strip():
+                try:
+                    from gateway.register_audit import audit_sent_message_async
+
+                    def _on_register_leak(_text: str, _recipient: str) -> None:
+                        logger.warning(
+                            "register_audit: post-delivery leak flagged on send_message "
+                            "target=current (%s) — recall gap the deterministic gate missed",
+                            platform_name,
+                        )
+
+                    audit_sent_message_async(
+                        cleaned_message, chat_id, regex_verdict=False,
+                        on_leak=_on_register_leak,
+                    )
+                except Exception:
+                    logger.debug("register_audit: scheduling failed", exc_info=True)
         return json.dumps(result)
     except Exception as e:
         return json.dumps(_error(f"Send failed: {e}"))
@@ -772,7 +971,7 @@ SEND_MESSAGE_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "description": "Delivery target. Format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
+                "description": "Delivery target. Use 'current' (or omit target) to reply in the chat this turn came from — the current conversation. After a send with target='current', do NOT add any further reply text or a confirmation/status line (e.g. 'Sent ✅', 'Enviado', 'Done') — the send IS the reply; any trailing text is a duplicate the user sees as a second message. Cross-channel format: 'platform' (uses home channel), 'platform:#channel-name', 'platform:chat_id', or 'platform:chat_id:thread_id' for Telegram topics and Discord threads. Examples: 'telegram', 'telegram:-1001234567890:17585', 'discord:999888777:555444333', 'discord:#bot-home', 'slack:#engineering', 'signal:+155****4567', 'matrix:!roomid:server.org', 'matrix:@user:server.org', 'ntfy:alerts-channel' (explicit ntfy topic), 'yuanbao:direct:<account_id>' (DM), 'yuanbao:group:<group_code>' (group chat)"
             },
             "message": {
                 "type": "string",
@@ -790,6 +989,40 @@ SEND_MESSAGE_SCHEMA = {
         "required": []
     }
 }
+
+
+# Tool-gated reply delivery (``reply_gate_mode == "tool"``).
+#
+# In that mode the model's free text is NOT auto-delivered, and
+# ``send_message(target="current", ...)`` is the ONLY sanctioned way to reply or to
+# explicitly decide silence. The mechanism is useless without a tool for the model to
+# call: with no registration the model finds no ``send_message`` in its schema and falls
+# back to a workaround (``hermes send`` via terminal), which bypasses reply-gate
+# bookkeeping entirely — so the fail-loud "undecided_delivered" fallback ALSO fires,
+# producing a double send plus a narrated-status leak into a real group (confirmed
+# 2026-07-11).
+#
+# Registering it is therefore gated on the opt-in, not unconditional: upstream's intent
+# ("the agent must not fire off cross-platform messages on its own") is fully preserved
+# for every deployment that has not opted into tool-gated delivery, and for prompt-mode
+# (the default) this is byte-identical to not registering at all.
+def _check_send_message_tool_gated() -> bool:
+    try:
+        from gateway.config import load_gateway_config
+        cfg = load_gateway_config()
+        return str(getattr(cfg, "reply_gate_mode", "prompt")).strip().lower() == "tool"
+    except Exception:
+        return False
+
+
+registry.register(
+    name="send_message",
+    toolset="messaging",
+    schema=SEND_MESSAGE_SCHEMA,
+    handler=send_message_tool,
+    check_fn=_check_send_message_tool_gated,
+    emoji="📤",
+)
 
 
 _PLUGIN_COMPAT_LAZY = {

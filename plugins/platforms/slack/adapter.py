@@ -3107,6 +3107,9 @@ class SlackAdapter(BasePlatformAdapter):
 
     # ----- Reactions -----
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _react(
         self, channel: str, timestamp: str, emoji: str, team_id: str, *, remove: bool) -> bool:
         """reactions.add / reactions.remove; True on success. Failures (already reacted,
@@ -3148,7 +3151,7 @@ class SlackAdapter(BasePlatformAdapter):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction when message processing begins."""
         target = self._reacting_target(event)
-        if target is None:
+        if target is None or self._processing_reaction_suppressed(event):
             return
         ts, team_id, _marker = target
         channel_id = getattr(event.source, "chat_id", None)
@@ -3163,7 +3166,7 @@ class SlackAdapter(BasePlatformAdapter):
         ts, team_id, marker = target
         self._reacting_message_ids.discard(marker)
         channel_id = getattr(event.source, "chat_id", None)
-        if not channel_id:
+        if not channel_id or self._processing_reaction_suppressed(event):
             return
         await self._react(channel_id, ts, "eyes", team_id, remove=True)
         final = {ProcessingOutcome.SUCCESS: "white_check_mark", ProcessingOutcome.FAILURE: "x"}

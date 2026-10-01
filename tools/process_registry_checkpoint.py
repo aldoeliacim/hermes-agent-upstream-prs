@@ -34,6 +34,12 @@ class ProcessCheckpointMixin:
                     # See #77484.
                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
+                    # The ownership snapshot is part of a recoverable record: without
+                    # it a recovered session belongs to nobody provable, and the
+                    # registry gate refuses it rather than attributing it to whoever
+                    # happens to be recovering. Kept out of _CHECKPOINT_FIELDS so
+                    # checkpoints written before this field still load.
+                    entry["owner_context"] = getattr(s, "owner_context", None) or {}
                     entries.append(entry)
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
@@ -99,7 +105,12 @@ class ProcessCheckpointMixin:
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
             # detached: can't read output, but can report status + kill
-            session = ProcessSession(id=entry["session_id"], detached=True, **fields)
+            # A checkpoint written before the ownership snapshot existed recovers
+            # as an unowned session: the gate fails it closed instead of letting
+            # the recovering caller inherit the resource.
+            session = ProcessSession(id=entry["session_id"], detached=True,
+                                     owner_context=entry.get("owner_context") or {},
+                                     **fields)
             with self._lock:
                 self._running[session.id] = session
             recovered += 1

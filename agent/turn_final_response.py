@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
@@ -17,10 +18,134 @@ from agent.turn_stop_gates import apply_stop_gates
 
 logger = logging.getLogger("agent.conversation_loop")
 
+# Some summarizer/context routes return their internal handoff as the assistant
+# answer. A whole XML envelope alone is ambiguous — HTML legitimately uses a
+# <summary> element — so require at least two handoff-style Markdown headings,
+# including one that denotes state or future work. An explicit user request for
+# an HTML summary element always wins.
+_INTERNAL_SUMMARY_ENVELOPE = re.compile(
+    r"^\s*<summary(?:\s[^>]*)?>[\s\S]*</summary>\s*$", re.IGNORECASE,
+)
+_INTERNAL_SUMMARY_HEADING = re.compile(
+    r"(?im)^\s*(?:#{1,6}\s+|<h[1-6]\b[^>]*>\s*)"
+    r"(overview|summary|task|progress|current\s+state|next\s+steps|completed|remaining|open\s+tasks)\b"
+    r"(?:\s*</h[1-6]>)?"
+)
+# A whole fenced XML handoff is still a handoff, not a user-facing code sample.
+# Only unwrap when the fence encloses the ENTIRE answer; examples embedded in a
+# real answer remain examples and do not trigger the recovery path.
+_WHOLE_XML_FENCE = re.compile(
+    r"\A\s*```(?:xml|html)?[ \t]*\r?\n(?P<body>[\s\S]*?)\r?\n```[ \t]*\s*\Z",
+    re.IGNORECASE,
+)
+_INTERNAL_SUMMARY_STATE_HEADINGS = {
+    "progress", "current state", "next steps", "remaining", "open tasks",
+}
+_EXPLICIT_SUMMARY_ELEMENT_REQUEST = re.compile(
+    r"(?is)(?:\b(?:return|respond|output|write|generate|provide|emit|create)\b.{0,120}<\s*summary\b"
+    r"|<\s*summary\b.{0,120}\b(?:html|element|tag|markup)\b)"
+)
+_INTERNAL_SUMMARY_RECOVERY_NUDGE = (
+    "Your previous output was an internal context handoff, not an answer to the user. "
+    "Do not repeat, quote, or discuss it. Answer the latest real user message directly."
+)
+_INTERNAL_SUMMARY_SAFE_FAILURE = "I couldn't complete that response correctly. Please try again."
+_INTERNAL_SUMMARY_MAX_RETRIES = 2
+
+# The same handoff can arrive as a PREFIX (envelope, then prose, then a tool call written
+# as text), which the whole-response match lets through. The handoff is a BLOCK: the
+# opening tag starts the response on its own line and the closing tag sits on its own
+# line. Inline ``<summary>label</summary> prose`` (HTML discussion) never has that shape,
+# and the block must still carry handoff headings (same rule as the whole envelope).
+_LEADING_SUMMARY_BLOCK = re.compile(
+    r"\A\s*<summary(?:\s[^>]*)?>[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*</summary>", re.IGNORECASE,
+)
+# Internal handoffs are structural, not identified by a magic English sentence.
+# Providers may preface the block with acknowledgements or append a trailing note;
+# both are unsafe if a top-level multiline <summary> contains state headings.
+# Limit the preface to prevent matching an XML example deep in a normal answer.
+_PREFATORY_SUMMARY_BLOCK = re.compile(
+    r"\A(?P<preface>[\s\S]{1,600}?)^[ \t]*<summary(?:\s[^>]*)?>[ \t]*\r?\n"
+    r"(?P<body>[\s\S]*?)\r?\n[ \t]*</summary>(?:[ \t]*\r?\n[\s\S]*)?[ \t]*\Z",
+    re.IGNORECASE | re.MULTILINE,
+)
+# A tool call the model wrote as TEXT in a foreign harness dialect instead of the native
+# function-calling channel: a line-anchored ``<tag>{json}</tag>`` call
+# (``<execute_bash>{"CommandLine": ...}</execute_bash>``) or XML call markup. The call
+# never executes, and the markup (with its internal commands and paths) would be shown
+# verbatim. Fenced code is excluded, so a requested example still gets through.
+_TEXT_TOOL_MARKUP = re.compile(
+    r"^[ \t]*<([a-z][a-z0-9_]{2,40})>[ \t]*\r?\n?[ \t]*\{[\s\S]*?\}[ \t]*\r?\n?[ \t]*</\1>"
+    r"|^[ \t]*<(?:function_calls|tool_call)>"
+    r"|^[ \t]*<invoke\s+name=",
+    re.IGNORECASE | re.MULTILINE,
+)
+_FENCED_CODE = re.compile(r"^[ \t]*(```|~~~)[\s\S]*?^[ \t]*\1[ \t]*$", re.MULTILINE)
+_ARTIFACT_RECOVERY_NUDGES = {
+    "summary_envelope": _INTERNAL_SUMMARY_RECOVERY_NUDGE,
+    "text_tool_markup": (
+        "Your previous output wrote a tool call as text markup instead of using the native "
+        "function-calling interface, so nothing executed and the markup would have been "
+        "shown to the user. Do not repeat or quote that markup. If you need a tool, call it "
+        "through the native tool interface; otherwise answer the latest real user message "
+        "directly."
+    ),
+}
+
+
+def _has_handoff_headings(text: str) -> bool:
+    headings = [" ".join(h.lower().split()) for h in _INTERNAL_SUMMARY_HEADING.findall(text)]
+    return len(headings) >= 2 and any(h in _INTERNAL_SUMMARY_STATE_HEADINGS for h in headings)
+
+
+def is_internal_summary_artifact(text: Any, *, user_message: Any = "") -> bool:
+    """Whether *text* is a whole internal handoff envelope, not requested HTML."""
+    if not isinstance(text, str) or not _INTERNAL_SUMMARY_ENVELOPE.fullmatch(text):
+        return False
+    request = user_message if isinstance(user_message, str) else ""
+    if request and _EXPLICIT_SUMMARY_ELEMENT_REQUEST.search(request):
+        return False
+    return _has_handoff_headings(text)
+
+
+def internal_artifact_kind(text: Any, *, user_message: Any = "") -> Optional[str]:
+    """Classify *text* as internal scaffolding that must never reach a user.
+
+    ``"summary_envelope"``: a compaction handoff, either the whole response or a leading
+    block envelope followed by anything, in both cases carrying handoff headings.
+    ``"text_tool_markup"``: a tool call written as text outside fenced code.
+    ``None`` otherwise. Structural, not keyword-based: prose about summaries, HTML tags or
+    tool syntax, fenced examples, and an explicitly requested ``<summary>`` element stay
+    deliverable.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return None
+    request = user_message if isinstance(user_message, str) else ""
+    explicit_html = bool(request and _EXPLICIT_SUMMARY_ELEMENT_REQUEST.search(request))
+    if not explicit_html:
+        fenced = _WHOLE_XML_FENCE.fullmatch(text)
+        if fenced and is_internal_summary_artifact(fenced.group("body")):
+            return "summary_envelope"
+        if is_internal_summary_artifact(text):
+            return "summary_envelope"
+        # Whole fenced handoffs were handled above. Any remaining fenced
+        # blocks are examples inside a real response, not agent handoffs.
+        unfenced = _FENCED_CODE.sub("", text)
+        block = _LEADING_SUMMARY_BLOCK.match(unfenced)
+        if block and _has_handoff_headings(block.group(1)):
+            return "summary_envelope"
+        prefatory = _PREFATORY_SUMMARY_BLOCK.match(unfenced)
+        if prefatory and _has_handoff_headings(prefatory.group("body")):
+            return "summary_envelope"
+    if _TEXT_TOOL_MARKUP.search(_FENCED_CODE.sub("", text)):
+        return "text_tool_markup"
+    return None
+
+
 # Ephemeral retry scaffolding rows popped before the final answer becomes durable.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_thinking_prefill", "_empty_recovery_synthetic", "_empty_terminal_sentinel",
-    "_dropped_toolcall_nudge",
+    "_dropped_toolcall_nudge", "_internal_summary_recovery",
 )
 
 
@@ -124,6 +249,43 @@ def finish_text_response(
         if _ev.action == "break":
             return _verdict("break")
         return _verdict("continue")
+
+    # Reject an internal artifact (compaction handoff or a tool call written as text)
+    # before it can become durable or user-visible. Preserve strict alternation with an
+    # ephemeral assistant/user retry pair; a kind-specific nudge tells the model what to fix.
+    _artifact_kind = internal_artifact_kind(final_response, user_message=user_message)
+    if _artifact_kind:
+        retries = int(getattr(agent, "_internal_summary_retries", 0) or 0)
+        logger.error(
+            "Internal artifact (%s) rejected before persistence "
+            "(retry=%d/%d model=%s provider=%s session=%s)",
+            _artifact_kind,
+            retries + 1,
+            _INTERNAL_SUMMARY_MAX_RETRIES,
+            getattr(agent, "model", "") or "unknown",
+            getattr(agent, "provider", "") or "unknown",
+            getattr(agent, "session_id", "") or "none",
+        )
+        if retries < _INTERNAL_SUMMARY_MAX_RETRIES:
+            agent._internal_summary_retries = retries + 1
+            artifact_msg = agent._build_assistant_message(assistant_message, "incomplete")
+            if _promoted:
+                artifact_msg["api_content"] = final_response
+            artifact_msg["_internal_summary_recovery"] = True
+            append_message(messages, artifact_msg)
+            append_message(messages, {
+                "role": "user",
+                "content": _ARTIFACT_RECOVERY_NUDGES[_artifact_kind],
+                "_internal_summary_recovery": True,
+            })
+            agent._session_messages = messages
+            final_response = None
+            return _verdict("continue")
+        agent._internal_summary_retries = 0
+        assistant_message.content = _INTERNAL_SUMMARY_SAFE_FAILURE
+        final_response = _INTERNAL_SUMMARY_SAFE_FAILURE
+    else:
+        agent._internal_summary_retries = 0
 
     agent._empty_content_retries = 0
     agent._thinking_prefill_retries = 0

@@ -1606,7 +1606,17 @@ def _main_model_pin() -> Tuple[Optional[str], Optional[str]]:
     provider = None
     with contextlib.suppress(Exception):
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        provider = _normalize_job_optional_text(resolve_runtime_provider(requested=None).get("provider"))
+        # Snapshot the REQUESTED provider name, not the resolved internal label.
+        # `resolve_runtime_provider` returns provider="custom" for any custom-provider
+        # entry (omniroute, etc.), but "custom" is ALSO a literal config key pointing at
+        # a different (paid) base_url. Storing the label makes the snapshot fail to
+        # round-trip: the scheduler feeds it back as `requested="custom"` and silently
+        # resolves to openrouter.ai instead of the local router — the exact spend swap
+        # the snapshot exists to prevent. `requested_provider` is the round-trippable name.
+        snap = resolve_runtime_provider(requested=None)
+        provider = _normalize_job_optional_text(
+            snap.get("requested_provider") or snap.get("provider")
+        )
     return (provider.lower() if provider else None), model
 
 
@@ -2614,6 +2624,35 @@ def advance_next_runs(job_ids) -> int:
                 or job.get("schedule", {}).get("kind") not in {"cron", "interval"}
             ):
                 continue
+            # Stamp the occurrence we are about to run BEFORE advancing, so the
+            # same-day duplicate-cron guard in the due scan can tell "the
+            # scheduler already fired this local date" from "a human ran it
+            # manually". This must live in the BATCH function: the tick's
+            # due-dispatch loop calls advance_next_runs() directly, so stamping
+            # only in the advance_next_run() wrapper would leave the field
+            # unwritten on the real scheduler path and the guard reading a value
+            # nothing ever sets.
+            #
+            # A MANUAL occurrence must never stamp this scheduler-only field.
+            # trigger_job sets next_run_at == manual_run_at (string-exact) for
+            # the run-now fire, and a manual run traverses this very batch
+            # (trigger_job -> advance_next_runs -> mark_job_run). If it stamped
+            # last_scheduled_run_at, the genuine scheduled occurrence later the
+            # same local day would be wrongly deduped away. Detect it via the
+            # occurrence's own manual_run_at marker (same string-exact match
+            # _evaluate_due_job uses), not a time heuristic.
+            scheduled_run_at = job.get("next_run_at")
+            is_manual_occurrence = (
+                scheduled_run_at is not None
+                and job.get("manual_run_at") == scheduled_run_at
+            )
+            if scheduled_run_at and not is_manual_occurrence:
+                try:
+                    job["last_scheduled_run_at"] = _ensure_aware(
+                        datetime.fromisoformat(scheduled_run_at)
+                    ).isoformat()
+                except Exception:
+                    job["last_scheduled_run_at"] = scheduled_run_at
             new_next = compute_next_run(job["schedule"], now)
             if new_next and new_next != job.get("next_run_at"):
                 job["next_run_at"] = new_next
@@ -2917,6 +2956,85 @@ class _DueJob:
         return compute_next_run(self.schedule, self.scan.now.isoformat())
 
 
+def _cron_runs_at_most_once_per_local_day(schedule: Dict[str, Any], reference: datetime) -> bool:
+    """Return True for cron schedules that cannot fire twice on one local date.
+
+    Derived from croniter rather than brittle field parsing, so it catches
+    daily/weekly/monthly schedules while leaving schedules such as
+    ``0 */3 * * *`` or ``0 13,19,1 * * *`` alone. croniter is driven on the
+    configured IANA zone's naive wall clock (see ``compute_next_run``), so the
+    dates compared here are local dates, not UTC ones.
+    """
+    if schedule.get("kind") != "cron" or not _ensure_croniter():
+        return False
+    expr = schedule.get("expr")
+    if not expr:
+        return False
+    try:
+        zone = get_timezone()
+        base = reference - timedelta(days=1)
+        base_wall = base.astimezone(zone).replace(tzinfo=None) if zone else base.replace(tzinfo=None)
+        cron = croniter(expr, base_wall)
+        seen_dates = set()
+        # Fixed 8-occurrence probe bound: from a base one day BEFORE the
+        # reference, three DISTINCT local dates settle the question — a
+        # multi-daily schedule reveals a repeated date well before then (>=2
+        # per day), while a once-per-day schedule reaches three distinct dates
+        # within a handful of steps. Eight steps comfortably covers the densest
+        # multi-daily grid we gate on without an unbounded croniter walk; the
+        # first repeat (return False) or the third distinct date (return True)
+        # short-circuits, and exhausting the loop conservatively classifies as
+        # once-per-day.
+        for _ in range(8):
+            occurrence = cron.get_next(datetime)
+            local_date = occurrence.date()
+            if local_date in seen_dates:
+                return False
+            seen_dates.add(local_date)
+            if len(seen_dates) >= 3:
+                return True
+        return True
+    except Exception:
+        return False
+
+
+def _skip_duplicate_same_day_cron(d: _DueJob) -> bool:
+    """Skip an at-most-once-per-local-day cron that already had a scheduled run today.
+
+    Timezone-change fix: a once-per-local-day cron whose old next_run_at was
+    computed in a different timezone can appear due a SECOND time on the same
+    local date after the tz change (an old UTC next_run_at fires in the morning,
+    then the same expression is reinterpreted in local time and looks due again
+    later that day). Uses the scheduler-only stamp (``last_scheduled_run_at``,
+    written by ``advance_next_runs``) rather than ``last_run_at`` so a manual
+    ``cron run`` earlier in the day cannot suppress the real scheduled
+    occurrence. True when this tick was skipped and next_run_at advanced past
+    the duplicate. Passed-over for explicit manual triggers, which are the
+    operator asking for this occurrence on purpose.
+    """
+    if d.kind != "cron" or not _cron_runs_at_most_once_per_local_day(d.schedule, d.next_run_dt):
+        return False
+    last_scheduled_run_at = d.job.get("last_scheduled_run_at")
+    if not last_scheduled_run_at:
+        return False
+    try:
+        last_scheduled_dt = _ensure_aware(datetime.fromisoformat(last_scheduled_run_at))
+    except Exception:
+        return False
+    if last_scheduled_dt.date() != d.next_run_dt.date():
+        return False
+    new_next = compute_next_run(d.schedule, d.next_run_dt.isoformat())
+    if not new_next:
+        return False
+    logger.info(
+        "Job '%s' already had a scheduled run on %s; skipping duplicate same-day cron "
+        "occurrence and advancing to %s",
+        d.label, last_scheduled_dt.date(), new_next,
+    )
+    d.scan.persist(d.job["id"], next_run_at=new_next)
+    return True
+
+
 def _repair_timezone_shifted_cron(d: _DueJob) -> bool:
     """Repair a cron job whose stored offset no longer matches now's (TZ migration).
 
@@ -3178,6 +3296,13 @@ def _evaluate_due_job(job: Dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         claim = {"at": now.isoformat(), "by": _machine_id()}
         job["run_claim"] = claim
         scan.persist(job["id"], run_claim=claim)
+
+    # Same-day duplicate-cron guard (timezone-change fix): see
+    # _skip_duplicate_same_day_cron. Placed AFTER the occurrence checks so a
+    # genuinely new occurrence on a new local date is never suppressed. Gated on
+    # not manual_run — an explicit operator `cron run` IS that occurrence.
+    if not manual_run and _skip_duplicate_same_day_cron(d):
+        return False
 
     # Missed-run visibility: persist scheduled-vs-actual timing so separate CLI processes can show a
     # late catch-up. Recurring only — expired one-shots were retired above; manual triggers aren't

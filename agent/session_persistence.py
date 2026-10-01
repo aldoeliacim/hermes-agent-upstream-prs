@@ -36,7 +36,9 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_verification_stop_synthetic",  # verify-on-stop nudge; the assistant candidate itself is NOT synthetic
     "_pre_verify_synthetic",
     "_kanban_stop_synthetic",  # kanban worker stop-guard
+    "_reply_decision_synthetic",  # reply-decision stop-loop nudge (#921); the assistant candidate is NOT synthetic
     "_dropped_toolcall_nudge",  # internal retry instruction; must not replay as user context
+    "_internal_summary_recovery",  # rejected handoff + retry nudge; never durable
 )
 
 _IMAGE_PART_TYPES = {"image", "image_url", "input_image"}

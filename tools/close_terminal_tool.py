@@ -5,7 +5,7 @@ desktop gateway wires to a ``terminal.close`` event. ``desktop_ui`` toolset only
 
 import json
 
-from tools.process_registry import process_registry
+from tools.process_registry import model_process_scope, process_registry
 from tools.registry import registry, tool_error
 
 
@@ -14,7 +14,12 @@ def close_terminal_tool(process_id: str) -> str:
     pid = (process_id or "").strip()
     if not pid:
         return tool_error("process_id is required (the background process whose tab to close).")
-    return json.dumps(process_registry.request_close_terminal(pid), ensure_ascii=False)
+    # The ownership scope is what makes the registry gate apply: inside it, a
+    # handle the caller does not own resolves as unknown, so a desktop window
+    # cannot close — or even probe — another window's tab. Without this wrapper
+    # the tool is a bearer-token read: any process id works.
+    with model_process_scope():
+        return json.dumps(process_registry.request_close_terminal(pid), ensure_ascii=False)
 
 
 CLOSE_TERMINAL_SCHEMA = {

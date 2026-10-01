@@ -570,7 +570,7 @@ _PER_TURN_RESET_STATE: Tuple[Tuple[str, Any], ...] = (
     ("_mute_post_response", False), ("_unicode_sanitization_passes", 0),
     ("_tool_guardrail_halt_decision", None),
     ("_iteration_budget_warning_injected", False),
-    ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0),
+    ("_run_budget_wrapup_injected", False), ("_verification_stop_nudges", 0), ("_reply_decision_nudges", 0),
     ("_pre_verify_nudges", 0),
 )
 
@@ -1058,6 +1058,19 @@ def build_turn_context(
         persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
     )
     _hydrate_from_history(agent, conversation_history)
+    # Baseline AFTER hydration: todos restored from a previous turn's transcript are prior
+    # state, not this turn's plan. Reconciliation reports only items this turn authored or
+    # changed, so a paused old plan never re-prompts on an unrelated later question.
+    # Defensive: reconciliation is an ADVISORY, so a store that cannot snapshot (custom or
+    # stubbed) must degrade to "no baseline, no nudge" and never break turn construction.
+    _snapshot = getattr(agent._todo_store, "snapshot", None)
+    try:
+        agent._todo_baseline = _snapshot() if callable(_snapshot) else None
+    except Exception:
+        agent._todo_baseline = None
+    agent._todo_reconciliation_attempted = False
+    # Request-only reconciliation pair; cleared here so a new turn never inherits one.
+    agent._todo_reconciliation_messages = None
     # Every estimator this turn prices images at the cost learned from this model's real usage.
     bind_image_token_cost(agent)
     # Append the user message now that close persistence is safe.

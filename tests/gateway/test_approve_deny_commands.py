@@ -202,6 +202,94 @@ class TestApproveCommand:
         assert e2.result == "session"
 
 
+def _make_runner_with_home(home_chat_id: str):
+    """A runner whose TELEGRAM platform HAS a configured home channel — the
+    multi-home / distinct-owner deployment the owner gate exists to protect."""
+    from gateway.config import HomeChannel
+
+    runner = _make_runner()
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="***",
+                home_channel=HomeChannel(
+                    platform=Platform.TELEGRAM, chat_id=home_chat_id, name="home",
+                ),
+            )
+        }
+    )
+    return runner
+
+
+class TestApproveOwnerGateHomeSensitivity:
+    """Regression for the no-home /approve auto-denial (#921 gap).
+
+    The owner gate in _handle_approve_command must fire ONLY when a home
+    channel is configured (a distinct owner to protect). A bare
+    source_is_non_owner() check — without the home_is_configured_for() guard —
+    auto-DENIES every /approve in a single-user deployment that never ran
+    /sethome, because ownership is unprovable when there is no home to prove it
+    against. This class pins BOTH sides: no-home owner keeps working; with-home
+    non-owner is still denied on the same choke point (which also covers the
+    bare-word plaintext path routed here by run_busy)."""
+
+    def setup_method(self):
+        _clear_approval_state()
+
+    @pytest.mark.asyncio
+    async def test_no_home_owner_approve_resolves(self):
+        """Single-user deploy with NO home configured: /approve must resolve,
+        not auto-deny. This is the case masked by tests that add a matching
+        HomeChannel."""
+        from tools.approval import _gateway_queues, has_blocking_approval
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        runner = _make_runner()  # PlatformConfig with NO home_channel
+        assert runner.config.platforms[Platform.TELEGRAM].home_channel is None
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+
+        e1 = _ApprovalEntry({"command": "cmd1"})
+        e2 = _ApprovalEntry({"command": "cmd2"})
+        _gateway_queues[session_key] = [e1, e2]
+
+        result = await runner._handle_approve_command(_make_event("/approve all"))
+
+        assert "2 commands" in result
+        assert e1.event.is_set()
+        assert e2.event.is_set()
+        assert e1.result == "once"
+        assert e2.result == "once"
+
+    @pytest.mark.asyncio
+    async def test_with_home_non_owner_approve_is_denied_and_auto_denies_pending(self):
+        """Deploy WITH a configured home whose chat_id differs from the source:
+        the source is a non-owner silo. /approve (and, via the same choke point,
+        a bare-word "approve") must be refused AND auto-DENY the pending request
+        so the dangerous command never runs and the thread does not hang."""
+        from tools.approval import _gateway_queues
+        from tools.approval_gateway_wait import _ApprovalEntry
+
+        # Home is a DIFFERENT chat than the source's "c1" => source is non-owner.
+        runner = _make_runner_with_home("owner-home-999")
+        source = _make_source()
+        session_key = runner._session_key_for_source(source)
+
+        e1 = _ApprovalEntry({"command": "rm -rf /"})
+        _gateway_queues[session_key] = [e1]
+
+        result = await runner._handle_approve_command(_make_event("/approve"))
+
+        # Refused: reports nothing to approve, never "1 command".
+        from agent.i18n import t
+
+        assert result == t("gateway.approve.no_pending")
+        # Auto-denied: pending entry resolved as deny, not left hanging.
+        assert e1.event.is_set()
+        assert e1.result == "deny"
+
+
 # ------------------------------------------------------------------
 # /deny command
 # ------------------------------------------------------------------

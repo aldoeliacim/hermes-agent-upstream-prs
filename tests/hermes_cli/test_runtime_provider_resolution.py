@@ -2200,3 +2200,43 @@ def test_openai_alias_without_base_url_pairs_openai_key_with_openai_base_url(mon
     runtime = rp.resolve_runtime_provider(requested="openai", target_model="gpt-x")
 
     assert (runtime["provider"], runtime["base_url"], runtime["api_key"]) == ("custom", "https://llm-proxy.corp.example/v1", "sk-proxy-issued")
+
+
+def test_resolve_runtime_provider_anthropic_pool_unavailable_reports_state(monkeypatch):
+    """A configured-but-exhausted pool names its state instead of the generic no-credentials error."""
+    class _Entry:
+        id = "anthropic-a"
+        label = "account-a@example.com"
+        access_token = "pool-token"
+        source = "manual"
+        base_url = "https://api.anthropic.com"
+        last_status = "exhausted"
+        last_error_code = 429
+        last_error_reason = "rate_limit_error"
+        last_error_message = "This request would exceed your account's rate limit. Please try again later."
+        last_error_reset_at = 1781513399.0
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self, model=None):
+            return None
+
+        def entries(self):
+            return [_Entry()]
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "anthropic")
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"provider": "anthropic"})
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr("agent.anthropic_credentials.resolve_anthropic_token", lambda *a, **k: None)
+
+    with pytest.raises(rp.AuthError) as exc_info:
+        rp.resolve_runtime_provider(requested="anthropic")
+
+    message = str(exc_info.value)
+    assert "Anthropic credential pool has 1 configured credential" in message
+    assert "account-a@example.com: exhausted (rate_limit_error)" in message
+    assert "2026-06-15 08:49 UTC" in message
+    assert "No Anthropic credentials found" not in message
+    assert exc_info.value.code == "credential_pool_unavailable"

@@ -588,6 +588,7 @@ class WebhookAdapter(BasePlatformAdapter):
             return _json_error("Cannot parse body", 400)
         headers = request.headers
         event_type = (headers.get("X-GitHub-Event", "") or headers.get("X-GitLab-Event", "")
+                      or headers.get("Linear-Event", "")
                       or payload.get("event_type", "") or payload.get("type", "") or "unknown")
         allowed_events = route_config.get("events", [])
         if allowed_events and event_type not in allowed_events:
@@ -615,8 +616,8 @@ class WebhookAdapter(BasePlatformAdapter):
             # cron_job routes: the job's own skills apply; the rendered prompt is only per-run context.
             if (skills := route_config.get("skills", [])) and not route_config.get("cron_job"):
                 prompt = self._apply_skills(prompt, skills)
-        delivery_id = headers.get("X-GitHub-Delivery", headers.get("svix-id", headers.get(
-            "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000))))))
+        delivery_id = headers.get("X-GitHub-Delivery", headers.get("Linear-Delivery", headers.get("svix-id", headers.get(
+            "webhook-id", headers.get("X-Request-ID", str(int(time.time() * 1000)))))))
         now = time.time()  # idempotency: skip duplicate deliveries (webhook retries)
         if not self._record_delivery_id(delivery_id, now):
             logger.info("[webhook] Skipping duplicate delivery %s", delivery_id)

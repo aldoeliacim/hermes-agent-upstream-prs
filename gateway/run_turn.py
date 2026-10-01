@@ -93,6 +93,91 @@ def _bg_prompt_preview(prompt: str, limit: int = 60) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _owner_trusted_chat_ids() -> frozenset:
+    """Chat IDs the owner has declared as entitled to owner-facing content.
+
+    A group the owner runs/administers (e.g. a personal ops room) is an owner-
+    trusted audience: every member is entitled to see mechanism/status narration
+    and owner-report register, exactly like the owner's own DM. Declared under
+    ``privacy.owner_trusted_chats`` in config as a list of chat IDs. Read fresh
+    per call so edits take effect without a restart.
+
+    NOTE: this exempts only the register/leak JUDGE — not outbound secret
+    scrubbing, which stays on for every group (a credential is a higher-stakes
+    class than register and must never leave in cleartext, trusted room or not).
+    """
+    ids = set()
+    with suppress(Exception):
+        from gateway.run import _load_gateway_config
+
+        raw = (_load_gateway_config().get("privacy") or {}).get("owner_trusted_chats") or []
+        for item in raw:
+            s = str(item).strip()
+            if s:
+                ids.add(s)
+    return frozenset(ids)
+
+
+def _destination_requires_privacy_guard(*, skip_owner_profile: bool, chat_type: str) -> bool:
+    """Whether outbound content is leaving the owner's private DM.
+
+    ``skip_owner_profile`` proves a non-owner identity. A shared group/channel is
+    never private even when the sender is the owner, so destination scope wins.
+    This gates outbound SECRET scrubbing; the register/leak judge has its own,
+    narrower owner-trusted-chat exemption (see ``_owner_trusted_chat_ids``).
+    """
+    return bool(skip_owner_profile) or str(chat_type or "dm").lower() != "dm"
+
+
+def register_overrule_action(reason: str, regex_trigger: str) -> str:
+    """Decide what to do when the reply was DELIVERED but the register verdict
+    was not a clean unanimous DELIVER. SINGLE SOURCE OF TRUTH — the run path and
+    the tests both import this, so the decision table cannot silently drift.
+
+    Three outcomes:
+
+    - ``"banner"``  — a deterministic trigger fired (``regex_trigger != "none"``).
+      Real corroboration: raise the ground-truth banner-with-body to the owner.
+    - ``"infra"``   — the judge lanes could not answer (``no_lane_answered`` /
+      ``one_seat_unavailable``) and nothing else flagged. Deliver silently and
+      raise at most one throttled, body-free infra alert.
+    - ``"silent"``  — anything else, notably ``judges_split`` with ``regex=none``:
+      both lanes answered but merely disagreed, with zero deterministic
+      corroboration. That is the LEAST reliable verdict (one noisy LLM judge) and
+      is NOT a leak — deliver silently, log only, never echo the contact's reply.
+
+    A bare judges_split is deliberately NOT signal: echoing a contact's clean
+    reply to the owner on one judge's cry is itself the false positive.
+    """
+    if regex_trigger != "none":
+        return "banner"
+    if reason in ("no_lane_answered", "one_seat_unavailable"):
+        return "infra"
+    return "silent"
+
+
+# Verdict.reason values that mean "the LLM lanes decided this ALONE, with no
+# deterministic detector corroborating." A hold carrying one of these is pure
+# LLM opinion — and per the repeated ground-truth cases, LLM per-message verdicts
+# are noisy (the identical clean text re-judges DELIVER on a re-run). A
+# deterministically-corroborated hold instead carries a detector label like
+# "ephemeral_infra_teardown" / "backend_substance_disclosure".
+_UNCORROBORATED_HOLD_REASONS = frozenset({"both_leak", "judges_split"})
+
+
+def dm_hold_is_corroborated(reason: str) -> bool:
+    """True when a DM hold has DETERMINISTIC corroboration (a detector fired),
+    False when it rests on LLM lanes alone (``both_leak`` / ``judges_split``).
+
+    Used to decide, when salvage cannot recover a clean span, whether silencing
+    the contact is justified. Silencing a contact on an uncorroborated LLM hold
+    is the false-positive class that keeps dropping clean contact replies — an
+    uncorroborated hold must deliver to the contact and merely SAMPLE to the
+    owner, never silence.
+    """
+    return bool(reason) and reason not in _UNCORROBORATED_HOLD_REASONS
+
+
 def is_context_overflow_failure_result(agent_result: dict, history_len: int) -> bool:
     """One verdict for "this failed turn is a context overflow", shared by transcript persistence
     (#1630 skip) and the user-facing reply so the two can never disagree.
@@ -172,8 +257,8 @@ class GatewayTurnMixin:
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
-        Priority (highest first): session ``/model`` → ``channel_overrides`` → global config/env
-        (``_resolve_gateway_model(user_config)`` and default provider resolution)."""
+        Priority (highest first): session ``/model`` → ``channel_overrides`` → sender
+        preference → global config/env (``_resolve_gateway_model(user_config)``)."""
         from gateway.run import (
             _credential_pool_for_provider, _get_channel_override, _resolve_gateway_model,
             _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
@@ -249,6 +334,7 @@ class GatewayTurnMixin:
                 unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
 
         cfg = getattr(self, "config", None)  # getattr: bare object.__new__ test runners
+        channel_selected = False
         if cfg and source is not None:
             ch = _get_channel_override(
                 cfg, source.platform, str(source.chat_id) if source.chat_id else "",
@@ -258,12 +344,29 @@ class GatewayTurnMixin:
             if ch:
                 if ch.model:
                     model = ch.model
+                    channel_selected = True
                 if ch.provider:
+                    channel_selected = True
                     runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider, target_model=model or None)
                     ch_runtime_model = runtime_kwargs.pop("model", None)
                     # Adopt the provider's bundled model only when the override named none.
                     if ch_runtime_model and not ch.model:
                         model = ch_runtime_model
+
+        if not channel_selected and not override and source is not None and getattr(source, "user_id", None):
+            from gateway.sender_model_preference import get_sender_model_preference
+            store = getattr(self, "session_store", None)
+            # Follow the owning profile when multiplexed, not the ambient scoped DB.
+            db_for_key = getattr(store, "_db_for_key", None)
+            db = db_for_key(skey) if db_for_key is not None else getattr(store, "_db", None)
+            # Test doubles and DB-less runners must not invent a preference.
+            if db is not None and callable(getattr(type(db), "get_sender_model_preference", None)):
+                preference = get_sender_model_preference(db, source)
+                if preference:
+                    provider, model = preference
+                    # Same resolver as channel overrides: credentials stay in the provider store.
+                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(provider, target_model=model)
+                    runtime_kwargs.pop("model", None)
 
         if override and skey:
             model, runtime_kwargs = self._apply_session_model_override(skey, model, runtime_kwargs)
@@ -380,6 +483,114 @@ class GatewayTurnMixin:
     def _event_thread_metadata(self, event, source):
         """Thread metadata for a send that replies to ``event`` on ``source``."""
         return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+
+    def _is_reply_tool_gated(self, source) -> bool:
+        """True when the tool-gated delivery inversion applies to THIS turn.
+
+        The inversion is armed only when BOTH conditions hold:
+
+        * the gateway is configured for tool-mediated replies
+          (``config.reply_gate_mode == "tool"``), and
+        * this turn's source carries the free-response reply policy
+          (``source.reply_policy == ReplyPolicy.FREE_RESPONSE``) — i.e. a
+          context where a silent turn is the likely, correct outcome.
+
+        Default-OFF: any other mode or policy (the ``"prompt"`` default, a DM,
+        a directly-gated mention) returns False, so ordinary turns keep the
+        existing prompt-driven free-text delivery and progress behaviour
+        byte-for-byte. This is the single predicate every seam consults; it is
+        deliberately cheap and side-effect free so it can be called at the
+        per-turn boundary, in shaping, in delivery, and in the progress-lane
+        gate without divergence.
+        """
+        if getattr(getattr(self, "config", None), "reply_gate_mode", "prompt") != "tool":
+            return False
+        from gateway.reply_policy import ReplyPolicy
+
+        return getattr(source, "reply_policy", None) == ReplyPolicy.FREE_RESPONSE
+
+    @staticmethod
+    def _queued_followup_tail_action(
+        *,
+        intentional_silence: bool,
+        delivered_via_tool: bool,
+        first_response: str,
+        already_streamed: bool,
+        has_media: bool = False,
+    ) -> str:
+        """Decide what the queued-follow-up branch does with the turn's tail.
+
+        Returns one of: "silence" (intentional-silence marker), "tool_dedup"
+        (a send_message already delivered this turn — the free-text tail is
+        internal and must never auto-send), "send" (deliver the tail), "skip"
+        (already streamed / empty). Order matters and mirrors the direct and
+        streaming paths so no path can duplicate the final text.
+        """
+        if intentional_silence:
+            return "silence"
+        if delivered_via_tool:
+            return "tool_dedup"
+        # "send" carries BOTH text and explicit media. When the text already
+        # streamed we still "send" if there is media to upload — the delivery
+        # block skips the duplicate text and only uploads the attachment.
+        # Skipping on already_streamed alone would drop the media of a
+        # streamed-first-response turn.
+        if first_response and (not already_streamed or has_media):
+            return "send"
+        return "skip"
+
+    @staticmethod
+    def _transcript_has_current_chat_send(agent_messages) -> bool:
+        """True if the current turn's transcript already carries a successful
+        send_message tool result — ground-truth evidence that a current-chat
+        delivery happened this turn, used alongside the turn-scoped delivery
+        ledger to keep the free-text tail from duplicating it.
+
+        A live gateway turn can only issue send_message with target="current"
+        (the live-turn scope guard in tools/send_message_tool.py refuses any
+        explicit cross-target send mid-turn), so any successful send_message
+        result in a live turn's transcript is necessarily a current-chat
+        delivery.
+
+        Scoped to the CURRENT turn only: agent_messages is the full retained
+        conversation for a long-lived session, so the scan starts after the
+        last user-role message. A success from an earlier turn must not make
+        this return True on every later turn and permanently suppress the real
+        reply as a phantom duplicate. An action="silent" result returns
+        {"success": true, "decision": "silent"} — the tool call succeeded but
+        nothing was delivered, so it is skipped: silence is not a delivery.
+        Any per-message parse failure is skipped, never raised.
+        """
+        import json as _json
+        if not agent_messages:
+            return False
+        _turn_start = 0
+        for _i in range(len(agent_messages) - 1, -1, -1):
+            _m = agent_messages[_i]
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _turn_start = _i + 1
+                break
+        for msg in agent_messages[_turn_start:]:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") != "tool":
+                continue
+            # The canonical tool-result builder sets both "tool_name" and
+            # "name"; some synthetic error-result paths set only "name".
+            if "send_message" not in (msg.get("tool_name"), msg.get("name")):
+                continue
+            content = msg.get("content")
+            if not isinstance(content, str) or "success" not in content:
+                continue
+            try:
+                parsed = _json.loads(content)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, dict) and parsed.get("success") is True:
+                if parsed.get("decision") == "silent":
+                    continue
+                return True
+        return False
 
     @staticmethod
     def _pop_post_delivery_callback(adapter, key, generation):
@@ -1531,10 +1742,24 @@ class GatewayTurnMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
+        # Tool-gated turns invert the empty-tail contract: an empty or missing
+        # final_response is the EXPECTED shape of a correct silent turn (the
+        # model was told to reply via the send_message tool, or stay silent),
+        # so the two empty-normalizers below — which would otherwise manufacture
+        # a "⚠️ …no response…" explainer or a "worked without text" placeholder
+        # — must NOT fire. Suppressing them keeps the tail "" so the delivery
+        # seam can drop it silently instead of shipping a scaffold to the chat.
+        _tool_gated = self._is_reply_tool_gated(source)
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up may go silent, a human one must not.
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
-        if _intentional_silence and not is_machinery_display_kind(_silence_kind):
+        # A tool-gated free-response turn (reply_gate_mode "tool" in a shared chat) is where
+        # silence is the designed, usually-correct outcome: the reply-gate block in delivery owns
+        # that verdict and suppresses the bare marker. Rewriting it into a visible warning here
+        # would post "the model returned only a silence marker…" into the group every time the
+        # agent correctly stays out of a conversation. DMs, mentions and every other turn keep
+        # the visible fallback (silence to a human who addressed you looks like a dead bot).
+        if _intentional_silence and not is_machinery_display_kind(_silence_kind) and not _tool_gated:
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",
                 _platform_name, source.chat_id or "unknown",
@@ -1545,11 +1770,15 @@ class GatewayTurnMixin:
         # "(empty)" = the model produced no visible content after exhausting all retries. One
         # text with the CLI explainer and the desktop (agent/turn_explainers.py) so the user
         # reads the same words on every surface.
-        if response == "(empty)" and not _intentional_silence:
+        if response == "(empty)" and not _intentional_silence and not _tool_gated:
             from agent.turn_explainers import EMPTY_RESPONSE_EXPLANATION
 
             _model = str(agent_result.get("model") or "").strip() or "The model"
             response = "⚠️ " + EMPTY_RESPONSE_EXPLANATION.format(model=_model)
+        elif response == "(empty)" and _tool_gated:
+            # Gated: "(empty)" is a correct silent turn, not an error. Drop the
+            # sentinel so the delivery seam suppresses the tail cleanly.
+            response = ""
         agent_messages = agent_result.get("messages", [])
         logger.info(
             "response ready: platform=%s chat=%s session=%s time=%.1fs api_calls=%d response=%d chars",
@@ -1569,7 +1798,12 @@ class GatewayTurnMixin:
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
         if not _intentional_silence:
-            response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            if not _tool_gated:
+                # Gated turns skip this: it would turn a correct empty silent
+                # tail into a "worked without text" placeholder and defeat the
+                # suppression. Sanitisation still runs so a non-empty gated tail
+                # is cleaned identically to any other.
+                response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
             response = _sanitize_gateway_final_response(source.platform, response)
 
         # The agent thread already updated the contextvar; propagate to SessionEntry + _save() only
@@ -1933,6 +2167,180 @@ class GatewayTurnMixin:
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
+        # Reply-gate delivery decision. Fires for free-response group turns under
+        # reply_gate_mode="tool" (`tool_gated`), plus the mode-independent dedup whenever a
+        # current-chat tool send already delivered this turn (`_delivered_via_tool`). Runs AFTER
+        # transcript persistence and only suppresses PLATFORM delivery, never the transcript —
+        # mirroring the intentional-silence contract above. Inert (default-OFF) for DMs,
+        # mention-gated groups and prompt mode, except for the dedup guard, which is correct in
+        # every mode: a duplicated message is always wrong.
+        tool_gated = self._is_reply_tool_gated(source)
+        # Turn-scoped delivery counters. The authoritative object is the TurnDeliveryState bound at
+        # the outer per-inbound-message scope (`_handle_message_with_agent`): it is shared by
+        # IDENTITY across the whole re-entrant follow-up chain and every tool-worker thread, so it
+        # counts sends that fire in ANY follow-up run (the legacy per-source counter missed those).
+        # Fall back to the legacy source-object counter only if the state is somehow unbound
+        # (defensive; should not happen in a live gateway turn).
+        from tools.approval import get_turn_delivery_state
+        _turn_state = get_turn_delivery_state()
+        if _turn_state is not None:
+            _tool_send_count = int(getattr(_turn_state, "tool_sends", 0) or 0)
+            _decided_silent_count = int(getattr(_turn_state, "decided_silent", 0) or 0)
+        else:
+            _tool_send_count = int(getattr(source, "reply_gate_tool_sends", 0) or 0)
+            _decided_silent_count = int(getattr(source, "reply_gate_decided_silent", 0) or 0)
+        _delivered_via_tool = _tool_send_count > 0
+        # AUTHORITATIVE dedup signal: scan the immutable turn transcript. The counter is a
+        # FAST-PATH HINT only — production measurement showed it wrong ~44% of the time (it read 0
+        # on turns whose transcript proved a successful send, because mutable state on an object
+        # whose identity diverges across the turn lifecycle). The transcript is ground truth: a
+        # live turn can only send with target="current" (the live-turn scope guard refuses any
+        # explicit cross-platform target mid-turn), so ANY successful send_message result here is
+        # necessarily a current-chat delivery. Record counter-vs-transcript divergence at WARNING
+        # so the burn-in review can see how often the fast path misses.
+        _transcript_delivered = False
+        try:
+            _transcript_delivered = self._transcript_has_current_chat_send(agent_messages)
+        except Exception:
+            logger.debug("transcript send-scan failed", exc_info=True)
+        if _transcript_delivered and not _delivered_via_tool:
+            logger.warning(
+                "reply_gate: counter MISS — transcript proves a current-chat send but "
+                "reply_gate_tool_sends=%d (session=%s). Transcript scan is authoritative; "
+                "counter is a fast-path hint only.",
+                _tool_send_count, session_entry.session_id,
+            )
+        # Monotonic OR: the counter can only add false-negatives, never false-positives.
+        _delivered_via_tool = _delivered_via_tool or _transcript_delivered
+        # Was the RAW final text (before any normalization) a substantive answer? Decides between
+        # the last-resort fail-loud delivery and the quiet "undecided" suppression. Whitespace-only
+        # is NOT substantive — a tail with nothing in it is never normalized into a delivery.
+        _had_substantive_tail = bool(response.strip()) and not _intentional_silence
+
+        # Three-way DECISION outcome (not a binary deliver/suppress): the model must EXPLICITLY
+        # choose reply (send_message(target="current", ...)) or silent (send_message(target="current",
+        # action="silent")). When neither call happened, silence is still the outcome — but it is
+        # logged as a DISTINCT "undecided" outcome (never merged into "silent") so a model that
+        # never learns to call the tool is visible in telemetry.
+        if tool_gated or _delivered_via_tool:
+            _decided_silent = _decided_silent_count > 0
+            if _delivered_via_tool:
+                # Dedup (defense in depth): a tool-driven send already delivered to this chat, so
+                # the free-text tail must never ALSO auto-deliver — a duplicate is always wrong.
+                # A tool send WINS over a silent decision if both are somehow set: a delivered
+                # message must never be reported as "silent".
+                _reply_gate_suppress = True
+                _reply_gate_outcome = "replied"
+            elif _decided_silent:
+                # Explicit decision to stay silent — the clean, intended path. Nothing to deliver;
+                # the decision is on record.
+                _reply_gate_suppress = True
+                _reply_gate_outcome = "silent"
+            elif _had_substantive_tail:
+                # Undecided BUT with real content. The forced-decision nudges
+                # (agent/reply_decision_stop.py) already failed to get an explicit call, so
+                # suppressing here would discard a genuine answer — CONFIRMED casualty 2026-07-11
+                # (a complete 1260-char answer was silently dropped and the user only found out two
+                # days later). Silently dropping a real answer a SECOND time is a worse failure
+                # mode than an occasional over-eager delivery — fail loudly instead: deliver it as
+                # the last-resort safety net, logged at WARNING so this path is never invisible.
+                _reply_gate_suppress = False
+                _reply_gate_outcome = "undecided_delivered"
+                # BUT "non-empty" is not the same as "a real answer". CONFIRMED real casualty
+                # 2026-07-11 (twice within 5 minutes): the model's non-empty tail was pure
+                # meta-commentary about its own missing send_message tool, and fail-loud delivered
+                # THAT as if it answered the conversation. Fail-loud exists to rescue a genuine
+                # answer, not to promote the model's internal reasoning about tooling. Screen for
+                # that specific leak class before delivering.
+                from gateway.response_filters import is_leaked_tool_mechanism_narration
+                if is_leaked_tool_mechanism_narration(response):
+                    _reply_gate_suppress = True
+                    _reply_gate_outcome = "undecided_mechanism_leak_suppressed"
+            else:
+                # Genuinely nothing to deliver (empty/whitespace-only tail) — suppression here
+                # loses nothing, so this stays the quiet "undecided" outcome, not the loud fallback.
+                _reply_gate_suppress = True
+                _reply_gate_outcome = "undecided"
+            _reply_gate_log = (
+                logger.warning
+                if _reply_gate_outcome in ("undecided_delivered", "undecided_mechanism_leak_suppressed")
+                else logger.info
+            )
+            _reply_policy = getattr(source, "reply_policy", None)
+            _reply_gate_log(
+                "reply_gate: tool-mode session=%s policy=%s chars=%d tool_sends=%d "
+                "decided_silent=%d suppressed=%s outcome=%s",
+                session_entry.session_id,
+                getattr(_reply_policy, "value", _reply_policy),
+                len(response),
+                _tool_send_count,
+                _decided_silent_count,
+                _reply_gate_suppress,
+                _reply_gate_outcome,
+            )
+            if _reply_gate_suppress:
+                # Break the verdict-imitation feedback loop: the suppressed tail (typically a
+                # stay-silent verdict) was persisted as a normal assistant row by the agent loop, so
+                # the NEXT turn would replay it as something the model previously "said" — and the
+                # model imitates it (measured live: one replayed verdict seeded 20+ near-identical
+                # copies). Tag the row so the history build excludes it from the API replay;
+                # transcripts and exports keep the full record. Best-effort: a miss means one more
+                # replayed verdict, never a broken turn.
+                if response.strip():
+                    try:
+                        _sdb = getattr(self, "_session_db", None)
+                        _db = getattr(_sdb, "_db", None) if _sdb else None
+                        if _db is not None:
+                            _db.set_latest_matching_message_display_kind(
+                                session_entry.session_id,
+                                role="assistant",
+                                content=response,
+                                display_kind="reply_gate_scratch",
+                            )
+                    except Exception:
+                        logger.debug("reply_gate: scratch tagging failed", exc_info=True)
+                response = ""
+
+        # Deterministic privacy gate (fail-closed). The LAST line of defence before ANY
+        # platform egress on the ordinary final-response path — direct, queued-follow-up
+        # and streamed turns all funnel their to-be-sent text through here. A positive
+        # match suppresses PLATFORM delivery only (the transcript already persisted the
+        # full record above, mirroring the reply-gate / intentional-silence contract) and
+        # NEVER surfaces which class matched: exposing the mechanism would teach the model
+        # how to phrase around it. The async cross-user audit lane is intentionally NOT
+        # invoked here (that lane is only required off the send_message tool path, which
+        # has no post-turn transcript persistence to lean on).
+        #
+        # Audience-scoped with the same rule as the rest of the privacy stack
+        # (_destination_requires_privacy_guard): the owner's own private DM is the one
+        # audience entitled to mechanism / status / backend detail about the owner's own
+        # infrastructure, so it is not screened. Screening it silently dropped the owner's
+        # own answers and hid the drop from them. Groups and non-owner DMs stay screened;
+        # if the owner check itself errors, the screen runs (fail-closed).
+        if response.strip():
+            try:
+                _screen_final = _destination_requires_privacy_guard(
+                    skip_owner_profile=self._should_skip_user_profile_for_source(
+                        source=source, session_key=session_key,
+                    ),
+                    chat_type=getattr(source, "chat_type", "dm"),
+                )
+            except Exception:
+                logger.debug("privacy_gate: audience check failed; screening", exc_info=True)
+                _screen_final = True
+        else:
+            _screen_final = False
+        if _screen_final:
+            from gateway.delivery_judge import deterministic_privacy_leak_reason
+            _leak_reason = deterministic_privacy_leak_reason(response)
+            _dest_chat_id = str(getattr(source, "chat_id", "") or "").strip()
+            if _leak_reason and _dest_chat_id not in _owner_trusted_chat_ids():
+                logger.warning(
+                    "privacy_gate: suppressed final delivery for session %s (deterministic match)",
+                    session_entry.session_id,
+                )
+                response = ""
+
         adapter = self._delivery_adapter_for(source)
         # Auto voice reply (TTS audio before the text) unless streaming TTS already delivered audio.
         _streaming_tts_done = adapter is not None and bool(
@@ -2166,6 +2574,30 @@ class GatewayTurnMixin:
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
+        # --- Reply-gate delivery-accounting primitives: per-turn binding ---------------
+        # Bind the turn-scoped ContextVars the send_message tool + post-turn delivery block
+        # read. Placed AFTER the early-return above (a dropped/prepared-only turn must not
+        # leak state) and OUTSIDE the try below so the finally that clears them always runs
+        # with the matching reset tokens. These are the PRIMITIVES only:
+        #   * current message source -> lets send_message(target="current") resolve THIS chat;
+        #   * a fresh TurnDeliveryState -> the single ledger direct/queued/streaming all read;
+        #   * the tool-gated flag -> the ReplyPolicy / reply_gate_mode semantic
+        #     layer decides when this turn's replies must be tool-mediated and a
+        #     bare free-text tail suppressed. `_is_reply_tool_gated(source)` is
+        #     the single source of truth (mode=="tool" AND FREE_RESPONSE policy);
+        #     it is default-OFF so ordinary turns are byte-identical. See
+        #     gateway-semantic-port.md.
+        from tools.approval import (
+            set_current_message_source, reset_current_message_source,
+            set_turn_delivery_state, reset_turn_delivery_state, TurnDeliveryState,
+            set_reply_tool_gated_turn, reset_reply_tool_gated_turn,
+        )
+        _reply_gate_src_token = set_current_message_source(source)
+        _reply_gate_delivery_token = set_turn_delivery_state(TurnDeliveryState())
+        _reply_gate_tool_gated_token = set_reply_tool_gated_turn(
+            self._is_reply_tool_gated(source)
+        )
+
         try:
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -2235,6 +2667,276 @@ class GatewayTurnMixin:
                 response = f"{response}\n\n{_footer_line}"
             await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
+            # Content-privacy guard for outbound finals leaving the owner's private DM.
+            # A shared group/channel is visible to people beyond the sender, so it is
+            # screened even when the owner is the sender; a proven non-owner identity is
+            # screened in DM too. Run only the deterministic privacy classes here — the
+            # semantic register judge is a DM concept and would misread group prose.
+            try:
+                _skip_owner_profile = self._should_skip_user_profile_for_source(
+                    source=source, session_key=session_key,
+                )
+                _shared_destination = getattr(source, "chat_type", "dm") != "dm"
+                if response and _destination_requires_privacy_guard(
+                    skip_owner_profile=_skip_owner_profile,
+                    chat_type=getattr(source, "chat_type", "dm"),
+                ):
+                    # Outbound secret backstop: outside the owner's PRIVATE DM, scrub any
+                    # credentials/tokens/keys before the reply leaves the gateway, BEFORE the
+                    # judge sees it (live order: redact -> regex label -> judge). The owner's
+                    # NAME is intentionally NOT rewritten: skip_user_profile keeps USER.md out
+                    # of a non-owner prompt, and a blanket name rewrite reads as robotic and
+                    # mangles FILE:/MEDIA: paths.
+                    from gateway.run import _redact_secrets_for_non_owner
+                    response = _redact_secrets_for_non_owner(response)
+                    from gateway.response_filters import (
+                        mentions_recipient_third_person,
+                        is_owner_report_scaffold,
+                        recipient_aliases_for,
+                    )
+                    _recip_aliases = recipient_aliases_for(
+                        getattr(source, "chat_id", None),
+                        getattr(source, "user_name", ""),
+                    )
+                    # The name the judges are told (stored name + the names the recipient is
+                    # addressed by), shared by the first verdict, salvage and the re-judge.
+                    from gateway.response_filters import recipient_label_for_judge
+                    _judge_recipient = recipient_label_for_judge(
+                        getattr(source, "chat_id", None),
+                        getattr(source, "user_name", ""),
+                    )
+                    # Judge only what will actually be sent. A turn that already replied via
+                    # send_message(target="current") has its free-text tail suppressed as a
+                    # duplicate by the reply-gate dedup, so the guard must not alarm about
+                    # text nobody would have received (a false alarm fires on exactly the
+                    # turns that went WELL). `_delivered_via_tool` is authoritative here.
+                    from tools.approval import get_turn_delivery_state
+                    _gate_state = get_turn_delivery_state()
+                    _gate_tool_sends = (
+                        int(getattr(_gate_state, "tool_sends", 0) or 0) if _gate_state is not None
+                        else int(getattr(source, "reply_gate_tool_sends", 0) or 0)
+                    )
+                    _delivered_via_tool = _gate_tool_sends > 0
+                    try:
+                        _delivered_via_tool = (
+                            _delivered_via_tool
+                            or self._transcript_has_current_chat_send(agent_messages)
+                        )
+                    except Exception:
+                        logger.debug("transcript send-scan failed", exc_info=True)
+                    _tail_reaches_recipient = not _delivered_via_tool
+                    _is_dm = getattr(source, "chat_type", "dm") == "dm"
+                    # The regexes survive only as a LABEL in the owner note; ground truth
+                    # records which cheap signal, if any, would have caught a real leak.
+                    _name_leak = bool(
+                        _tail_reaches_recipient
+                        and _is_dm
+                        and mentions_recipient_third_person(
+                            response, getattr(source, "user_name", ""), _recip_aliases
+                        )
+                    )
+                    _struct_leak = bool(
+                        _tail_reaches_recipient
+                        and _is_dm
+                        and is_owner_report_scaffold(response)
+                    )
+                    _regex_leak = _name_leak or _struct_leak
+                    _request_text = str(prepared.persist_user_message or "")
+                    # A commission may predate dozens of tool calls. Take recent
+                    # USER turns only, not the last N transcript rows; assistant
+                    # or tool text is not evidence that this user asked for it.
+                    from gateway.delivery_judge import recent_user_requests_for_judge
+                    _judge_history = recent_user_requests_for_judge(
+                        history, current_request=_request_text
+                    )
+                    _verdict = None
+                    # POSITION / SHAPE IS LOAD-BEARING: the DM branch runs the semantic
+                    # register judge UNCONDITIONALLY for every non-owner DM final — it is
+                    # never nested under a regex trigger. The shared-destination branch is
+                    # an ``elif`` running only the deterministic classes.
+                    if _tail_reaches_recipient and _is_dm and response:
+                        from gateway.delivery_judge import judge_delivery
+
+                        _verdict = await asyncio.get_running_loop().run_in_executor(
+                            None,
+                            lambda: judge_delivery(
+                                response,
+                                _judge_recipient,
+                                request=_request_text,
+                                history=_judge_history,
+                            ),
+                        )
+                    elif _tail_reaches_recipient and _shared_destination and response:
+                        from gateway.delivery_judge import (
+                            LEAK,
+                            Verdict,
+                            deterministic_privacy_leak_reason,
+                        )
+
+                        # Group/channel content is visible to people beyond the sender,
+                        # even when the sender is the owner. Deterministic classes only;
+                        # register judging is a DM concept and would misread group prose.
+                        #
+                        # EXCEPTION: a group the owner has declared owner-trusted
+                        # (privacy.owner_trusted_chats) is an entitled audience —
+                        # every member may see mechanism/status narration and
+                        # owner-report register, exactly like the owner's own DM.
+                        # The leak guard protects a THIRD PARTY's private data from
+                        # an unentitled audience; it is not a register/tone filter,
+                        # so it must not fire here. (Outbound secret scrubbing above
+                        # still runs — a credential is a higher-stakes class and
+                        # never leaves in cleartext, trusted room or not.)
+                        _dest_chat_id = str(getattr(source, "chat_id", "") or "").strip()
+                        _owner_trusted_dest = _dest_chat_id in _owner_trusted_chat_ids()
+                        if not _owner_trusted_dest:
+                            _group_reason = deterministic_privacy_leak_reason(response)
+                            if _group_reason:
+                                _verdict = Verdict(True, LEAK, LEAK, _group_reason)
+                    if _verdict is not None:
+                        _trigger = "name" if _name_leak else ("structure" if _struct_leak else "none")
+                        if _verdict.hold:
+                            # SALVAGE before suppressing: a hold that nukes an
+                            # otherwise-clean reply is itself a harm — the
+                            # recipient gets silence. If the leak is a separable
+                            # leading/trailing block and the remaining contiguous
+                            # span independently judges DELIVER, ship the clean
+                            # body to the recipient and route only the stripped
+                            # note to the owner. Decider-driven (re-judges via the
+                            # same lanes), DM-only (group uses deterministic
+                            # classes, which are not span-separable this way).
+                            _salvage = None
+                            if _is_dm and not _shared_destination:
+                                from gateway.delivery_judge import (
+                                    salvage_deliverable_span,
+                                )
+
+                                _salvage = await asyncio.get_running_loop().run_in_executor(
+                                    None,
+                                    lambda: salvage_deliverable_span(
+                                        response,
+                                        _judge_recipient,
+                                        request=_request_text,
+                                        history=_judge_history,
+                                    ),
+                                )
+                            if _salvage is not None and _salvage.ok:
+                                logger.warning(
+                                    "owner_register_leak: SALVAGED clean span "
+                                    "(recipient=%s session=%s kept=%d stripped=%d "
+                                    "scope=%s regex=%s judges=%s/%s) — delivering "
+                                    "body, rerouting stripped note to owner",
+                                    getattr(source, "user_name", "?"),
+                                    session_entry.session_id,
+                                    len(_salvage.body),
+                                    len(_salvage.stripped),
+                                    "shared" if _shared_destination else "dm",
+                                    _trigger,
+                                    _verdict.prosecutor, _verdict.reader,
+                                )
+                                await self._reroute_leaked_reply_to_owner(
+                                    source, _salvage.stripped, salvaged=True
+                                )
+                                response = _salvage.body
+                            elif not dm_hold_is_corroborated(_verdict.reason) and \
+                                    not await self._confirm_uncorroborated_hold(
+                                        response, source, _request_text, history=_judge_history):
+                                # UNCORROBORATED hold (both_leak / judges_split, regex=none)
+                                # that did NOT survive re-judging. LLM per-message verdicts
+                                # are noisy: a genuinely clean reply flips to DELIVER when
+                                # re-sampled, while a real leak stays LEAK. This one flipped
+                                # -> it is noise (the warm clean-DM false-positive class).
+                                # DELIVER to the contact; sample a copy to the owner so a
+                                # genuine miss is still visible.
+                                logger.warning(
+                                    "owner_register_leak: uncorroborated hold did NOT survive "
+                                    "re-judging — DELIVERED to contact "
+                                    "(recipient=%s session=%s chars=%d scope=%s regex=%s judges=%s/%s reason=%s)",
+                                    getattr(source, "user_name", "?"),
+                                    session_entry.session_id,
+                                    len(response),
+                                    "shared" if _shared_destination else "dm",
+                                    _trigger,
+                                    _verdict.prosecutor, _verdict.reader, _verdict.reason,
+                                )
+                                await self._notify_owner_home(
+                                    source,
+                                    f"ℹ️ Delivered to *{getattr(source, 'user_name', '?')}* — a register "
+                                    f"hold (judges={_verdict.prosecutor}/{_verdict.reader} {_verdict.reason}; "
+                                    f"regex={_trigger}) did NOT survive re-judging, so it was treated as "
+                                    f"LLM noise, not a leak. If it WAS a real leak, it is a ground-truth "
+                                    f"case:\n\n{response}",
+                                    context="delivery_judge_uncorroborated_deliver",
+                                )
+                                # response left intact -> delivered to the contact.
+                            else:
+                                logger.warning(
+                                    "owner_register_leak: blocked privacy-sensitive final "
+                                    "(recipient=%s session=%s chars=%d scope=%s regex=%s judges=%s/%s reason=%s)"
+                                    " — rerouting to owner home",
+                                    getattr(source, "user_name", "?"),
+                                    session_entry.session_id,
+                                    len(response),
+                                    "shared" if _shared_destination else "dm",
+                                    _trigger,
+                                    _verdict.prosecutor, _verdict.reader, _verdict.reason,
+                                )
+                                await self._reroute_leaked_reply_to_owner(source, response)
+                                response = ""
+                        elif _verdict.reason in ("judges_split", "one_seat_unavailable", "no_lane_answered"):
+                            # Delivered — but WHY the owner hears about it depends on whether
+                            # there was any SIGNAL, not merely on the judges being non-unanimous.
+                            #
+                            # ROOT CAUSE this fixes: the old code fired the same ground-truth
+                            # banner (with the full reply body) for every non-unanimous reason,
+                            # including no_lane_answered — i.e. NEITHER judge ran at all. That
+                            # is pure infra failure, ZERO content signal; yet during any lane
+                            # flap every clean contact reply became a false "possible leak"
+                            # alert to the owner with the whole message pasted in. An alert
+                            # must fire on SIGNAL, never on the guard's own outage.
+                            #
+                            # Signal = a regex/deterministic hit. NOT a bare judges_split: two LLM
+                            # lanes disagreeing with zero deterministic corroboration is noise, not
+                            # a leak (see the block below).
+                            # Signal decision lives in ONE place: register_overrule_action().
+                            # See that function for the three-way table.
+                            _action = register_overrule_action(_verdict.reason, _trigger)
+                            logger.info(
+                                "owner_register_leak: delivered unconfirmed "
+                                "(recipient=%s reason=%s regex=%s judges=%s/%s action=%s)",
+                                getattr(source, "user_name", "?"),
+                                _verdict.reason, _trigger, _verdict.prosecutor, _verdict.reader,
+                                _action,
+                            )
+                            if _action == "banner":
+                                # Genuine deterministic corroboration worth turning into ground truth.
+                                await self._notify_owner_home(
+                                    source,
+                                    f"ℹ️ Delivered to *{getattr(source, 'user_name', '?')}* without a "
+                                    f"unanimous register verdict. Judges: prosecutor={_verdict.prosecutor} "
+                                    f"reader={_verdict.reader} ({_verdict.reason}); regex={_trigger}. "
+                                    f"If this was a real leak, it is a ground-truth case.\n\n{response}",
+                                    context="delivery_judge_overrule",
+                                )
+                            elif _action == "infra":
+                                # Pure infra failure: the register judges could not run and nothing
+                                # else flagged the content. Deliver silently; raise at most ONE
+                                # throttled infra alert (no message body) so the owner learns the
+                                # guard is degraded without being spammed per-message.
+                                await self._alert_register_judges_degraded(source, _verdict.reason)
+                            else:
+                                # "silent": judges_split with regex=none — the lanes answered but
+                                # disagreed and nothing deterministic corroborated. Deliver silently
+                                # and log only. One noisy judge is not a leak and must not alarm the
+                                # owner nor echo the contact's clean reply.
+                                logger.info(
+                                    "owner_register_leak: split-no-signal delivered silently "
+                                    "(recipient=%s prosecutor=%s reader=%s)",
+                                    getattr(source, "user_name", "?"),
+                                    _verdict.prosecutor, _verdict.reader,
+                                )
+            except Exception as _e:
+                logger.debug("Non-owner content-privacy gate skipped: %s", _e)
+
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
@@ -2260,6 +2962,11 @@ class GatewayTurnMixin:
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Reset reply-gate primitives in reverse bind order. finally guarantees no
+            # cross-turn ContextVar leak even on the error-reply / early-return paths above.
+            reset_reply_tool_gated_turn(_reply_gate_tool_gated_token)
+            reset_turn_delivery_state(_reply_gate_delivery_token)
+            reset_current_message_source(_reply_gate_src_token)
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
@@ -2435,6 +3142,10 @@ class GatewayTurnMixin:
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
+            # Same identity gate as the live turn: a background task started from a contact's chat
+            # must not carry the owner's USER.md profile. Fail-closed inside the predicate.
+            skip_user_profile = self._should_skip_user_profile_for_source(
+                source=source, user_config=user_config)
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
@@ -2472,6 +3183,7 @@ class GatewayTurnMixin:
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    skip_user_profile=skip_user_profile,
                     **{k: getattr(source, k) for k in (
                         "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
                     )},
@@ -2738,10 +3450,22 @@ class GatewayTurnMixin:
             _consumer_cfg, _pause_typing_before_finalize = self._build_stream_consumer_config(
                 source, _scfg, _adapter, on_missing_cursor="fallback",
             )
+            # Reply-gate: the stream is a real delivery path. Feed it the turn-scoped ledger
+            # so a streamed free-text reply and a same-turn send_message tool call resolve to
+            # ONE delivery decision (no duplicate tail). Reads the ContextVar live at emit time
+            # so a tool send that lands mid-stream is seen. Defaults to "not decided" outside a
+            # bound turn (get_turn_delivery_state() is None), preserving legacy streaming.
+            from tools.approval import get_turn_delivery_state as _get_turn_delivery_state
+
+            def _reply_gate_delivery_decided() -> bool:
+                _st = _get_turn_delivery_state()
+                return bool(_st is not None and _st.delivery_decided)
+
             return GatewayStreamConsumer(
                 adapter=_adapter, chat_id=source.chat_id, config=_consumer_cfg,
                 metadata=_thread_metadata, on_before_finalize=_pause_typing_before_finalize,
                 initial_reply_to_id=event_message_id, run_still_current=_run_still_current,
+                delivery_decided=_reply_gate_delivery_decided,
             )
         except Exception as _sc_err:
             logger.debug("Proxy: could not set up stream consumer: %s", _sc_err)
@@ -2996,7 +3720,22 @@ class GatewayTurnMixin:
 
         # Webhooks can't edit messages, so tool progress / log mode are off there.
         is_webhook = source.platform == Platform.WEBHOOK
-        tool_progress_enabled = progress_mode not in {"off", "log"} and not is_webhook
+        # Reply-gate: on a tool-gated free-response turn a silent outcome is the likely, correct
+        # result, so no progress-acknowledgement door may open — not interim scratch, not thinking
+        # bubbles, not Slack native task cards. (The plain-text 'Working on it' lane it also used to
+        # gate is gone entirely since #921; see tool_progress_enabled below.) Gating each emitter
+        # here is what closes R5/R6: nothing can emit a first ack, so nothing schedules a pending
+        # timer that could fire after a silent decision or duplicate on re-drain. The typing-indicator
+        # lane (_live_status_adapter, Lane D) and the log-to-file lane are deliberately NOT gated — a
+        # typing indicator is not a text acknowledgement, and log mode never reaches the chat.
+        # Default-OFF: false for DMs, mention-gated groups and prompt mode.
+        _reply_gated_silence_likely = self._is_reply_tool_gated(source)
+        # #921: the edited/rewritten progress-acknowledgement chat bubble was removed. No turn posts
+        # or edits a plain progress message any more, so the text progress lane is permanently off
+        # regardless of any legacy ``display.tool_progress`` value (all/new/verbose/plain). ``log``
+        # mode (tool_calls.log) and the Slack-native task-card lane are resolved separately below and
+        # keep working; ``progress_mode`` survives only to gate those.
+        tool_progress_enabled = False
         # Live status for text-rendering typing indicators (Slack); independent of tool_progress.
         _live_status_mode = resolve_display_setting(user_config, platform_key, "live_status", "full")
         _live_status_adapter = (
@@ -3009,10 +3748,17 @@ class GatewayTurnMixin:
         interim_assistant_messages_mode = _display_surface_mode(
             "interim_assistant_messages", default=True, require_platform_override_for={Platform.MATTERMOST},
         )
-        interim_assistant_messages_enabled = not is_webhook and interim_assistant_messages_mode != "off"
-        _thinking_enabled = _display_surface_mode(
-            "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
-        ) != "off"
+        interim_assistant_messages_enabled = (
+            not is_webhook
+            and interim_assistant_messages_mode != "off"
+            and not _reply_gated_silence_likely  # R5: no interim scratch on gated silence-likely turns
+        )
+        _thinking_enabled = (
+            _display_surface_mode(
+                "thinking_progress", default=False, require_platform_override_for={Platform.MATTERMOST},
+            ) != "off"
+            and not _reply_gated_silence_likely  # R6: no thinking bubbles on gated silence-likely turns
+        )
         # Slack-native task cards need the progress queue even with text tool_progress off.
         # Slack-native task cards (#29483): when the Slack adapter's opt-in is set, tool progress renders as
         # native plan/task cards via chat.startStream — the progress queue is needed even though Slack keeps
@@ -3027,6 +3773,7 @@ class GatewayTurnMixin:
             source.platform == Platform.SLACK
             and hasattr(adapter, "native_task_cards_enabled")
             and not (_tool_progress_explicit and progress_mode == "off")
+            and not _reply_gated_silence_likely  # R6: no native task cards on gated silence-likely turns
         ):
             try:
                 _native_slack_task_cards = bool(adapter.native_task_cards_enabled())
@@ -3042,7 +3789,11 @@ class GatewayTurnMixin:
             log_queue=queue.Queue() if log_mode_enabled else None,
             interim_assistant_messages_enabled=interim_assistant_messages_enabled,
             _thinking_enabled=_thinking_enabled, _native_slack_task_cards=_native_slack_task_cards,
-            needs_progress_queue=tool_progress_enabled or _thinking_enabled or _native_slack_task_cards,
+            # #921: the progress queue survives ONLY to drive the Slack-native task-card lane. The text
+            # progress-ack bubble (fed by tool_progress_enabled) and the `💬` thinking bubble (fed by
+            # _thinking_enabled) were removed, so neither forces the queue any more. Thinking events
+            # still flow to log mode / live-status, which have their own sinks.
+            needs_progress_queue=_native_slack_task_cards,
             _generic_status_phrase=_generic_status_phrase,
         )
 
@@ -3721,7 +4472,12 @@ class GatewayTurnMixin:
         )
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
-            if is_machinery_display_kind(turn_ctx.persist_user_display_kind):
+            # Same audience rule as the normal path: a tool-gated free-response turn keeps its
+            # silence (the reply gate owns that verdict); only a turn that expected a reply gets
+            # the visible fallback.
+            if is_machinery_display_kind(turn_ctx.persist_user_display_kind) or self._is_reply_tool_gated(
+                turn_ctx.source
+            ):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -4142,77 +4898,17 @@ class GatewayTurnMixin:
     async def _run_agent_notify_long_running(
         self, disp: "GatewayRunner._RunAgentDisplay", turn_ctx: TurnContext, _executor_task_holder: list,
     ) -> None:
-        """Periodic "still working" heartbeat, edited in place where supported. Stops once this run
-        no longer owns the session slot or the executor finished. ``_executor_task_holder[0]`` is
-        bound just after this task is scheduled (reads as None until then).
-
-        Interval: agent.gateway_notify_interval / HERMES_AGENT_NOTIFY_INTERVAL (default 180s; 0 or
-        long_running_notifications=off disables)."""
-        from gateway.run import _float_env, _interim_metadata, _non_conversational_metadata
-        _notify_start = time.time()
-        _NOTIFY_INTERVAL = _float_env("HERMES_AGENT_NOTIFY_INTERVAL", 180)
-        _long_running_mode = disp._display_surface_mode("long_running_notifications", default=True, allow_generic=True)
-        if _NOTIFY_INTERVAL <= 0 or _long_running_mode == "off":
-            return
-        source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
-        _status_thread_metadata = turn_ctx._status_thread_metadata
-        _notify_adapter = self._delivery_adapter_for(source)
-        if not _notify_adapter:
-            return
-        _heartbeat_msg_id: Optional[str] = None
-        while True:
-            await asyncio.sleep(_NOTIFY_INTERVAL)
-            if not self._should_emit_long_running_notification(
-                session_key, agent_holder[0], _executor_task_holder[0]
-            ):
-                break
-            _elapsed_mins = int((time.time() - _notify_start) // 60)
-            # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
-            _status_detail = ""
-            _want_iteration_detail = bool(
-                disp.resolve_display_setting(disp.user_config, disp.platform_key, "busy_ack_detail", True)
-            )
-            _a = self._agent_activity_summary(agent_holder[0])
-            with suppress(Exception):
-                if _a:
-                    _parts = []
-                    if _want_iteration_detail:
-                        _parts.append(format_iteration_progress(_a["api_call_count"], _a["max_iterations"]))
-                    _action = _a.get("current_tool") or _a.get("last_activity_desc")
-                    if _action:
-                        _parts.append(str(_action))
-                    if _parts:
-                        _status_detail = " — " + ", ".join(_parts)
-            _heartbeat_text = (
-                disp._generic_status_phrase("status")
-                if _long_running_mode == "generic"
-                else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
-            )
-            try:
-                _notify_res = None
-                if _heartbeat_msg_id:
-                    try:
-                        _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
-                    except Exception as _ee:
-                        logger.debug("Heartbeat edit failed: %s", _ee)
-                        _notify_res = None
-                if not (_notify_res and getattr(_notify_res, "success", False)):
-                    # The edit above awaited; a drain/restart notice may have gone out meanwhile, and
-                    # a fresh "Working" bubble after it reads as a contradiction (#10990).
-                    if not self._should_emit_long_running_notification(
-                        session_key, agent_holder[0], _executor_task_holder[0]
-                    ):
-                        break
-                    _notify_res = await _notify_adapter.send(
-                        source.chat_id, _heartbeat_text,
-                        metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
-                    )
-                    if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
-                        _heartbeat_msg_id = str(_notify_res.message_id)
-                        if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
-            except Exception as _ne:
-                logger.debug("Long-running notification error: %s", _ne)
+        """No-op since #921 (formerly a periodic "still working" heartbeat that posted and edited a
+        progress chat message via ``_heartbeat_msg_id``). Retained as a coroutine so the existing
+        spawn/await/cleanup wiring in ``_run_agent`` is unchanged; it returns immediately."""
+        # #921: the periodic "still working" heartbeat posted a progress chat message and edited it in
+        # place via ``_heartbeat_msg_id`` (the edit path). Both the post and the edit were part of the
+        # edited/rewritten progress-acknowledgement machinery that was removed: a turn must never post
+        # or edit a progress message. This heartbeat is now a no-op. Long-running visibility is carried
+        # by the native ephemeral typing/presence indicator and live-status task cards, which are not
+        # chat messages. The coroutine is retained (still spawned/awaited by _run_agent) so the task
+        # wiring and cleanup stay unchanged; it simply returns immediately.
+        return
 
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: List[Dict[str, Any]],

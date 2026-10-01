@@ -2181,6 +2181,16 @@ display:
   show_reasoning: true    # Show model reasoning/thinking above each response (default: true; toggle with /reasoning show|hide)
   streaming: false        # Stream tokens to terminal as they arrive (real-time output)
   show_cost: false        # Show estimated $ cost in the CLI status bar
+  processing_reaction: static  # Messaging: emoji reaction set on the user's message while working.
+                          #   static — fixed 👀 → 👍/👎 lifecycle (default; unchanged behaviour)
+                          #   smart  — deterministic zero-cost contextual picker (category by text:
+                          #            question/task/gracias/jaja/urge/media…, ES+EN), anti-repeat per
+                          #            chat, varied success emoji; failure stays 👎. Opt-in.
+                          #   off    — no processing reaction at all
+                          # Per-platform overridable via display.platforms.<platform>.processing_reaction.
+                          # `reactions` enable gates still decide whether the adapter may react. (A fork
+                          # with a reply-gate must suppress the start reaction on free-response group turns
+                          # that may stay silent; this base has no reply-gate concept.)
   vim_mode: false         # CLI only: vi/vim keybindings in the input composer (Esc → NORMAL, i → INSERT). The live NORMAL/INSERT/REPLACE mode shows at the right of the status bar. Config-only, read at startup.
   timestamps: false       # When true, prefixes user and assistant labels with timestamps in the CLI / TUI transcript
   timestamp_format: "%H:%M"  # strftime format for those timestamps (e.g. "%b-%d %H:%M" for month-day)

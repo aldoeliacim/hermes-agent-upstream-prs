@@ -2495,6 +2495,9 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] %s reaction %s on %s raised", verb, ident, message_id, exc_info=True)
         return None
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _add_reaction(self, message_id: str, emoji_type: str) -> Optional[str]:
         """Return the reaction_id on success, else None. The id is needed later for deletion."""
         if not self._client or not message_id or not emoji_type:
@@ -2521,7 +2524,8 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         message_id = event.message_id
-        if not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions:
+        if (not self._reactions_enabled() or not message_id or message_id in self._pending_processing_reactions
+                or self._processing_reaction_suppressed(event)):
             return
         reaction_id = await self._add_reaction(message_id, _FEISHU_REACTION_IN_PROGRESS)
         if reaction_id:
@@ -2533,7 +2537,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         message_id = event.message_id
-        if not self._reactions_enabled() or not message_id:
+        if not self._reactions_enabled() or not message_id or self._processing_reaction_suppressed(event):
             return
         start_reaction_id = self._pending_processing_reactions.get(message_id)
         if start_reaction_id:

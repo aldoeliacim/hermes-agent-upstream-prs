@@ -20,6 +20,26 @@ from agent.context_compressor import (
 
 
 
+def test_latest_message_wins_over_inherited_active_task():
+    """The handoff must explicitly privilege the latest user message over a
+    stale historical task snapshot — the core #35344 contract."""
+    """The handoff must explicitly privilege the latest user message over a
+    stale historical task snapshot — the core #35344 contract."""
+    lower = SUMMARY_PREFIX.lower()
+    assert "latest real user message" in lower
+    assert HISTORICAL_TASK_HEADING.lower() in lower
+    # Conflict-resolution must be explicit, not implied.
+    assert "precedence immediately" in lower
+    assert "never revive cancelled or completed tasks" in lower
+    # The "consistent -> use as background" carveout licensed stale-task
+    # resumption on topic overlap (#41607, #38364) — it must stay gone.
+    assert "you may use the summary as background" not in lower
+    assert "topic overlap" in lower
+    # #80622: empty-after-handoff must not resume historical work.
+    assert "if no user message appears after this summary" in lower
+
+
+
 
 
 

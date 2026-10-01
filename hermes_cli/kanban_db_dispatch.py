@@ -1500,7 +1500,9 @@ def check_respawn_guard(
     checked BEFORE ``blocker_auth`` because the requeue stamps a quota-flavored
     ``last_failure_error`` that would otherwise park the task forever — that
     path never increments ``consecutive_failures``), ``"blocker_auth"``
-    (quota/auth pattern; the breaker still trips eventually), then for the
+    (quota/auth pattern, deferred only while the failing run is younger than
+    the cooldown so the deferral stays bounded and the breaker still trips),
+    then for the
     ready lane only ``"recent_success"`` (completed run within the window, unless
     a re-queue event arrived after it — a deliberate re-run) and ``"active_pr"``
     (PR URL in a recent comment; re-spawning risks a duplicate PR — unless a
@@ -1520,6 +1522,10 @@ def check_respawn_guard(
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
+    #    The latest *finished* attempt is chosen by monotonic run id, not by end
+    #    timestamp: a newer failure must win over an older quota/rate-limit run
+    #    even when their ``ended_at`` values tie or the newer one lands a second
+    #    early, otherwise the stale rate-limit run masks it forever.
     #    An infrastructure spawn refusal (#114720) shares the cooldown: the host
     #    condition is not the card's, so it retries forever, spaced, and never
     #    reaches the breaker.
@@ -1527,7 +1533,7 @@ def check_respawn_guard(
     latest_run = conn.execute(
         "SELECT outcome, ended_at, metadata FROM task_runs "
         "WHERE task_id = ? AND ended_at IS NOT NULL "
-        "ORDER BY ended_at DESC LIMIT 1",
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
@@ -1548,14 +1554,51 @@ def check_respawn_guard(
         # (spaced by the cooldown) until quota returns or a real run supersedes it.
         return None
 
-    # 2. Quota / auth blocker: retrying immediately will not help.  A plain
-    # crash is different: its persisted error includes the worker's last
-    # captured output, which is context rather than a diagnosis and may contain
-    # benign commands such as ``claude auth status`` (#117097).
+    # 2. Quota / auth blocker: retrying immediately will not help — but the
+    # deferral must stay finite. A plain crash is different: its persisted error
+    # includes the worker's last captured output, which is context rather than a
+    # diagnosis and may contain benign commands such as ``claude auth status``
+    # (#117097).
+    #
+    # ``blocker_auth`` is BOUNDED on purpose. The guard runs before any claim, so
+    # a deferred task records no new failure and ``consecutive_failures`` never
+    # moves; an open-ended deferral could never reach the circuit breaker and
+    # would park the task in ``ready`` forever (observed live: a filesystem
+    # "Permission denied" matched the regex and held four tasks for 8 days).
+    # Defer only while the failing run is fresh — younger than the same cooldown
+    # the rate-limit path uses; once the latest finished run is older than the
+    # cooldown, fall through and allow a probe so the breaker trips at
+    # ``failure_limit`` with the real error as the diagnosis. With no finished
+    # run to age (cooldown disabled, or the failure predates run tracking) there
+    # is nothing to bound the deferral by, so the probe is allowed too.
+    #
+    # Provenance guard (upstream PR 63268): a *local* workspace/spawn failure
+    # (``spawn_failed`` / ``gave_up``) is classified by its own outcome, not by
+    # quota/auth words that may appear incidentally in its captured text (e.g. a
+    # worktree path containing "quota", or a plain ``PermissionError``). Treating
+    # those by text would strand the task in ``blocker_auth`` before failure
+    # accounting ever sees them. ``crashed`` is excluded for the same reason
+    # (#117097): its persisted error is captured worker output, not a diagnosis.
     err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
-        return "blocker_auth"
+    if (
+        err
+        and latest_outcome not in {"crashed", "spawn_failed", "gave_up"}
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
+        failed_at = latest_run["ended_at"] if latest_run is not None else None
+        # Defer ONLY while a dated failure is fresh. Without a finished run to age (cooldown
+        # disabled, or the failure predates run tracking) there is no bound, and an unbounded
+        # deferral is the exact failure this guard exists to prevent: it records no failure,
+        # so the breaker can never trip and the task parks in ``ready`` forever. Fall through
+        # and allow a probe; a real auth failure then counts toward the breaker.
+        fresh = (
+            rl_cooldown > 0
+            and failed_at is not None
+            and (now - int(failed_at)) < rl_cooldown
+        )
+        if fresh:
+            return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
     # are the canonical *inputs* to a review handoff, not duplicate-work signals.

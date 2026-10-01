@@ -43,6 +43,16 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
     config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True)
     config.platforms[Platform.RELAY] = PlatformConfig(enabled=True)
     monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    # This contract is about the warning-suppression policy and the transport lanes, so it
+    # runs on the operator's home channel, where a failure notice passes through verbatim.
+    # (Off-home, the layer collapses failure notices to a neutral outcome-only line; that
+    # rule is pinned separately in test_non_home_failure_notice_is_outcome_only below.)
+    import cron.scheduler_delivery as _sd
+
+    monkeypatch.setattr(
+        _sd, "_get_home_target_chat_id", lambda p: "fixture" if p == "discord" else ""
+    )
+    monkeypatch.setattr(_sd, "_get_home_target_thread_id", lambda _p: "")
     sent = []
     fallbacks = []
 
@@ -90,3 +100,29 @@ def test_warning_policy_at_real_transport_boundary(tmp_path, monkeypatch, loop_t
     delivery_queue.enqueue("run", job, payload, for_failure=not for_failure)
     assert scheduler.drain_delivery_queue(adapters, loop_thread) == 0
     assert delivery_queue.get_status("run")["status"] == expected
+
+
+def test_non_home_failure_notice_is_outcome_only(tmp_path, monkeypatch, loop_thread):
+    """Layer rule, same transport path: a failure notice bound for a chat that is NOT the
+    operator's home goes out as the neutral outcome-only line, never the raw diagnostics."""
+    import cron.scheduler_delivery as _sd
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(delivery_queue, "DELIVERY_DB", tmp_path / "delivery.db")
+    (tmp_path / "config.yaml").write_text("cron: {wrap_response: false}\n")
+    config = GatewayConfig()
+    config.platforms[Platform.DISCORD] = PlatformConfig(enabled=True)
+    monkeypatch.setattr("gateway.config.load_gateway_config", lambda: config)
+    monkeypatch.setattr(_sd, "_get_home_target_chat_id", lambda p: "owner-home" if p == "discord" else "")
+    monkeypatch.setattr(_sd, "_get_home_target_thread_id", lambda _p: "")
+    sent = []
+
+    async def send(chat_id, content, metadata=None):
+        sent.append((chat_id, content))
+        return {"success": True, "message_id": "native-id"}
+
+    adapters = {Platform.DISCORD: SimpleNamespace(send=send, fronts_platform=lambda p: p == Platform.DISCORD)}
+    job = {"id": "fixture", "execution_id": "run", "deliver": "discord:contact-chat"}
+    delivery_queue.enqueue("run", job, "provider 401: invalid key sk-... at /etc/x", for_failure=True)
+    assert scheduler.drain_delivery_queue(adapters, loop_thread) == 1
+    assert sent == [("contact-chat", _sd._NON_OWNER_CRON_FAILURE)]

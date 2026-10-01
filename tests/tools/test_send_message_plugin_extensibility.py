@@ -187,6 +187,23 @@ def test_cli_and_cron_share_plugin_target_normalization(plugin_platform, monkeyp
     }
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Deliberate layer divergence from upstream v2026.9.14. Upstream asserts "
+        "send_message is absent from the model tool registry (host-only). This layer "
+        "keeps it registered but check_fn-gated on reply_gate_mode=='tool': "
+        "gateway/run.py, gateway/reply_policy.py and agent/reply_decision_stop.py "
+        "depend on it for tool-gated reply delivery, and its absence produced a real "
+        "double-send leak (group 'TAMHAL Y JVic', 2026-07-11) when the model fell back "
+        "to a `hermes send` CLI workaround that bypassed reply-gate bookkeeping. "
+        "strict=True: if this layer ever stops registering it, the suite fails here."
+    ),
+)
+def test_send_message_remains_host_only(plugin_platform):
+    from tools.registry import registry
+
+    assert registry.get_entry("send_message") is None
 
 
 def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkeypatch):
@@ -204,6 +221,16 @@ def test_force_reload_unregisters_profile_owned_platform(plugin_platform, monkey
     assert name not in manager._plugin_platform_names
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Same deliberate divergence as test_send_message_remains_host_only: the child "
+        "process reports whether send_message is model-registered, and this layer "
+        "registers it (check_fn-gated on reply_gate_mode) because gateway reply-gate "
+        "delivery depends on that tool existing. The host-send and cron halves of this "
+        "test still assert real behaviour and are unaffected."
+    ),
+)
 def test_fresh_process_real_plugin_fixture_covers_host_send_and_cron(tmp_path):
     """A standalone directory plugin is visible to host-driven send paths."""
     home = tmp_path / "home"

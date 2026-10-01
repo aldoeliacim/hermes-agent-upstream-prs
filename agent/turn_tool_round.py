@@ -207,6 +207,9 @@ def run_tool_round(
 
     # Save session log incrementally (so progress is visible even if interrupted)
     agent._session_messages = messages
+    # A tool round supersedes any staged reconciliation pair: the model acted on the
+    # advisory, so it must not ride the next request again.
+    agent._todo_reconciliation_messages = None
     # Touch activity so slow post-tool work plus a slow follow-up API call can't exceed
     # the gateway inactivity timeout (HERMES_AGENT_TIMEOUT).
     # Touch activity before continuing so the gateway's inactivity monitor never sees a stale timestamp

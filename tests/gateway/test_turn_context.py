@@ -32,13 +32,17 @@ def _make_runner(ctx):
 class TestTurnContext:
     def test_defaults_are_independent_containers(self):
         a, b = TurnContext(), TurnContext()
-        a.last_progress_msg[0] = "x"
-        a.repeat_count[0] = 3
         a._cleanup_msg_ids.append("1")
-        assert b.last_progress_msg == [None]
-        assert b.repeat_count == [0]
+        a.agent_holder[0] = "x"
         assert b._cleanup_msg_ids == []
+        assert b.agent_holder == [None]
 
+        # The outer body and the runner share the SAME list objects, so
+        # mutation through the ctx is visible to locals captured elsewhere.
+        cleanup_ids = []
+        ctx = TurnContext(_cleanup_msg_ids=cleanup_ids)
+        ctx._cleanup_msg_ids.append("123.456")
+        assert cleanup_ids[0] == "123.456"
 
 
 class TestTurnRunner:

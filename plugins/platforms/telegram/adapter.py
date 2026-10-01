@@ -662,6 +662,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: Dict[str, dict] = {}
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
+        self._session_trust_state: Dict[int, Dict[str, str]] = {}  # approval_id → contact session + owner identity
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
         # "important" (default): only final responses, approvals and slash confirmations notify;
@@ -1239,6 +1240,10 @@ class TelegramAdapter(BasePlatformAdapter):
                 return await _await_with_thread_deadline(
                     send_fn(**send_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
             except Exception as send_err:
+                # A scoped send must not widen: dropping the topic/reply anchor would
+                # deliver the message to the broader chat, so fail closed instead.
+                if metadata and metadata.get("strict_scope") is True:
+                    raise
                 if not self._should_retry_without_dm_topic_reply_anchor(send_err, metadata, reply_to_message_id):
                     raise
                 logger.warning(
@@ -1337,8 +1342,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return default
         return bool(value)
 
-    def _link_preview_kwargs(self) -> Dict[str, Any]:
-        if not getattr(self, "_disable_link_previews", False):
+    def _link_preview_kwargs(self, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        # Per-send metadata can disable previews for one message even when the
+        # adapter-wide setting is on: a scoped send must not emit a preview
+        # (the preview is an outbound fetch driven by message content).
+        if not (getattr(self, "_disable_link_previews", False)
+                or (metadata and metadata.get("disable_link_previews") is True)):
             return {}
         if LinkPreviewOptions is not None:
             return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
@@ -3534,13 +3543,15 @@ class TelegramAdapter(BasePlatformAdapter):
             try:
                 send_kwargs = {
                     "chat_id": normalize_telegram_chat_id(chat_id), "reply_to_message_id": reply_to_id, **thread_kwargs,
-                    **self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+                    **self._link_preview_kwargs(metadata), **self._notification_kwargs(metadata)}
                 return await self._send_chunk_markdown_or_plain(chunk, send_kwargs), used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
                     if self._is_thread_not_found_error(send_err) and effective_thread_id is not None:
-                        if private_dm_topic_send or (metadata and metadata.get("telegram_dm_topic_created_for_send")):
+                        if private_dm_topic_send or (metadata and (
+                                metadata.get("telegram_dm_topic_created_for_send")
+                                or metadata.get("strict_scope") is True)):
                             return SendResult(success=False, error=str(send_err), retryable=False)
                         # One-off "thread not found" flakes recover on immediate retry: same thread_id once.
                         if not retried_thread_not_found:
@@ -3556,7 +3567,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         continue
                     if "message to be replied not found" in str(send_err).lower() and reply_to_id is not None:
                         safe_send_error = _redact_telegram_error_text(send_err)
-                        if private_dm_topic_send:
+                        if private_dm_topic_send or (metadata and metadata.get("strict_scope") is True):
                             return SendResult(success=False, error=safe_send_error, retryable=False)
                         # Reply target deleted; private-topic fallback sends drop anchor + topic id together.
                         logger.warning("[%s] Reply target deleted, retrying without reply_to: %s", self.name, safe_send_error)
@@ -4002,7 +4013,7 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id: Optional[str], metadata: Optional[Dict[str, Any]], finalize: bool):
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message or None."""
-        base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
+        base = {**self._link_preview_kwargs(metadata), **self._notification_kwargs(metadata)}
         for use_markdown in (True, False) if finalize else (False,):
             try:
                 if use_markdown:
@@ -4268,6 +4279,53 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._send_prompt(
             "send_exec_approval", prompt.chat_id, prompt.metadata, build, parse_mode=ParseMode.HTML,
             thread_id=self._metadata_thread_id(prompt.metadata), reply_to_mode=self._reply_to_mode)
+
+    async def send_session_trust_approval(
+        self, chat_id: str, command: str, session_key: str,
+        description: str = "dangerous command", contact: str = "a non-owner contact",
+        owner_user_id: Optional[str] = None, request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Ask the Telegram owner to approve and trust a non-owner contact's session."""
+        def build():
+            import itertools
+
+            if not hasattr(self, "_approval_counter"):
+                self._approval_counter = itertools.count(1)
+            approval_id = next(self._approval_counter)
+            preview = command[:3500] + "..." if len(command) > 3500 else command
+            text = (
+                "🔐 <b>Contact session needs your approval</b>\n\n"
+                f"Contact: {_html.escape(str(contact))}\n"
+                f"Reason: {_html.escape(str(description))}\n\n"
+                f"<pre>{_html.escape(preview)}</pre>\n\n"
+                "<b>Trust session</b> approves this command and lets the rest of their conversation "
+                "run without re-prompting. <b>Deny</b> blocks this command. "
+                "Catastrophic commands stay blocked regardless."
+            )
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔓 Trust session", callback_data=f"ts:trust:{approval_id}"),
+                InlineKeyboardButton("❌ Deny", callback_data=f"ts:deny:{approval_id}"),
+            ]])
+
+            def remember(_message):
+                state = self._session_trust_state[approval_id] = {
+                    "session_key": session_key,
+                    "owner_chat_id": str(chat_id),
+                    # Telegram private-chat ids equal the user's id. Explicit HomeChannel.user_id
+                    # supports owner identity even when routing metadata evolves; absent identity
+                    # falls back to the DM id and fails closed for group home channels.
+                    "owner_user_id": str(owner_user_id or chat_id),
+                }
+                if request_id:
+                    state["request_id"] = str(request_id)
+
+            return text, keyboard, remember
+
+        return await self._send_prompt(
+            "send_session_trust_approval", chat_id, metadata, build, parse_mode=ParseMode.HTML,
+            thread_id=self._metadata_thread_id(metadata), reply_to_mode=self._reply_to_mode,
+        )
 
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str, confirm_id: str,
@@ -4716,6 +4774,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return
         for prefix, handler in (
             ("gt:", self._handle_gmail_triage_callback), ("ea:", self._handle_exec_approval_callback),
+            ("ts:", self._handle_session_trust_callback),
             ("sc:", self._handle_slash_confirm_callback), ("cl:", self._handle_clarify_callback),
             ("update_prompt:", self._handle_update_prompt_callback)):
             if data.startswith(prefix):
@@ -4775,6 +4834,77 @@ class TelegramAdapter(BasePlatformAdapter):
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
             self.resume_typing_for_chat(str(cb["chat_id"]))
+
+    async def _handle_session_trust_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
+        """``ts:<trust|deny>:<id>`` — owner-only resolution of a contact session's command."""
+        parts = data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in {"trust", "deny"}:
+            await query.answer(text="Invalid approval data.")
+            return
+        choice = parts[1]
+        try:
+            approval_id = int(parts[2])
+        except (ValueError, IndexError):
+            await query.answer(text="Invalid approval data.")
+            return
+        state = self._session_trust_state.get(approval_id)
+        if not state:
+            await query.answer(text="This approval has already been resolved.")
+            return
+
+        # Ordinary callback authorization is necessary but not sufficient: allowlisted contacts may
+        # use other Telegram controls. This prompt belongs solely to the configured home owner.
+        caller_id = str(getattr(query.from_user, "id", ""))
+        callback_chat_id = str(cb.get("chat_id") or "")
+        denial = "⛔ You are not authorized to approve commands."
+        if caller_id != state["owner_user_id"] or callback_chat_id != state["owner_chat_id"]:
+            await query.answer(text=denial)
+            return
+        if not await self._callback_authorized(query, cb, denial):
+            return
+        state = self._session_trust_state.pop(approval_id, None)
+        if not state:
+            await query.answer(text="This approval has already been resolved.")
+            return
+
+        session_key = state["session_key"]
+        count = 0
+        trusted = False
+        try:
+            from tools.approval import enable_session_yolo, resolve_gateway_approval
+
+            count = resolve_gateway_approval(
+                session_key, "once" if choice == "trust" else "deny",
+                request_id=state.get("request_id"),
+            )
+            if count and choice == "trust":
+                # Enable only after a live command was actually resolved. A stale/late button must
+                # never grant a contact future YOLO authority after the current gate timed out.
+                enable_session_yolo(session_key)
+                trusted = True
+            logger.info(
+                "Telegram session-trust resolved %d approval(s) for session %s (choice=%s, owner=%s)",
+                count, session_key, choice, caller_id,
+            )
+        except Exception as exc:
+            logger.error("Failed to resolve Telegram session-trust approval: %s", exc)
+
+        if not count:
+            label = "⌛ Approval expired"
+            edit_text = f"{label} — no command was waiting. It already timed out or was resolved elsewhere."
+        elif trusted:
+            label = "🔓 Session trusted"
+            edit_text = f"{label} by {getattr(query.from_user, 'first_name', 'Owner')}"
+        elif choice == "deny":
+            label = "❌ Denied"
+            edit_text = f"{label} by {getattr(query.from_user, 'first_name', 'Owner')}"
+        else:
+            # The current command was released before the local trust flip failed. Report the exact
+            # partial outcome instead of claiming it was denied or that future commands are trusted.
+            label = "✅ Approved once"
+            edit_text = f"{label}; session trust could not be enabled."
+        await query.answer(text=label)
+        await self._edit_md_quiet(query, edit_text)
 
     async def _handle_slash_confirm_callback(self, query, data: str, cb: Dict[str, Any]) -> None:
         """``sc:<choice>:<confirm_id>`` — resolve a slash-command confirmation."""
@@ -5581,7 +5711,11 @@ class TelegramAdapter(BasePlatformAdapter):
             await _action(message_thread_id=message_thread_id)
         except Exception as e:
             # DM topic lanes: Telegram may reject message_thread_id — retry without it so the indicator at
-            # least appears in the main DM view.
+            # least appears in the main DM view. A SCOPED lane must not take that
+            # fallback: widening the indicator would report activity in a chat the
+            # scope did not authorise, so fail closed instead.
+            if metadata and metadata.get("strict_scope") is True:
+                raise
             if _is_dm_topic and message_thread_id is not None:
                 try:
                     await _action()
@@ -7092,6 +7226,9 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         return str(configured).lower() not in {"false", "0", "no"}
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: Optional[str]) -> bool:
         """Set a single emoji reaction (``None`` clears all bot-set reactions, the documented Bot API way)."""
         if not self._bot:
@@ -7111,18 +7248,26 @@ class TelegramAdapter(BasePlatformAdapter):
         return await self._set_reaction(chat_id, message_id, None)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Add an in-progress reaction when message processing begins."""
+        """Add an in-progress reaction when message processing begins.
+
+        The emoji is chosen by ``_processing_ack_emoji`` (base): fixed 👀 in ``static`` mode, a
+        contextual anti-repeat pick in ``smart`` mode, and ``None`` when reactions are off for
+        this turn or the turn is a reply-gated silence-likely one. The per-platform
+        ``_reactions_enabled`` gate stays authoritative — it decides *whether* we may react.
+        """
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._set_reaction(chat_id, message_id, "\U0001f440")
+        emoji = self._processing_ack_emoji(event)
+        if chat_id and message_id and emoji:
+            await self._set_reaction(chat_id, message_id, emoji)
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Swap the in-progress reaction for a final success/failure reaction (set_message_reaction
-        replaces, not adds); CANCELLED explicitly clears the 👀."""
-        if not self._reactions_enabled():
+        replaces, not adds); CANCELLED explicitly clears the reaction. In ``smart`` mode the
+        success emoji is varied (anti-repeat) while failure stays an unambiguous 👎."""
+        if not self._reactions_enabled() or self._processing_reaction_suppressed(event):
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
@@ -7131,7 +7276,9 @@ class TelegramAdapter(BasePlatformAdapter):
         if outcome == ProcessingOutcome.CANCELLED:
             await self._clear_reactions(chat_id, message_id)
         else:
-            await self._set_reaction(chat_id, message_id, "\U0001f44d" if outcome == ProcessingOutcome.SUCCESS else "\U0001f44e")
+            await self._set_reaction(
+                chat_id, message_id,
+                self._processing_outcome_emoji(event, outcome == ProcessingOutcome.SUCCESS))
 
 
 # -- Plugin registration glue: register(ctx) plus the hook implementations (adapter factory, YAML→env/extra

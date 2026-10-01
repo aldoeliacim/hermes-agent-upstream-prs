@@ -499,6 +499,19 @@ _AUTH_HEADER_RE = re.compile(r"((?:Proxy-)?Authorization:\s*)([A-Za-z][\w.+-]*\s
 _SECRET_HEADER_NAMES = r"(?:x-api-key|x-goog-api-key|api-key|apikey|x-api-token|x-auth-token|x-access-token)"
 _SECRET_HEADER_RE = re.compile(rf"({_SECRET_HEADER_NAMES}\s*:\s*)(\S+)", re.IGNORECASE)
 
+# Prose-labelled credentials: a human-readable label, optional markdown
+# decoration, a colon, then an OPAQUE value ("- *Radarr API Key:* `6ed9…`").
+# Header/env shapes above miss the space in "API Key" and the */` decoration;
+# a compaction summary leaked exactly this into a held-reply alert
+# (2026-09-26). The value must be >=16 chars AND mix letters with digits, so
+# prose after a label ("Token: usa el que ya tienes") is never touched.
+_PROSE_SECRET_LABEL_RE = re.compile(
+    r"((?i:\b(?:api[\s_-]?key|access[\s_-]?token|auth[\s_-]?token|secret|token"
+    r"|clave\s+(?:de\s+)?api|contraseña|password))"
+    r"[*_`]*\s*:[*_`]*\s*`?)"
+    r"((?=[A-Za-z0-9_\-.]*\d)(?=[A-Za-z0-9_\-.]*[A-Za-z])[A-Za-z0-9_\-.]{16,})"
+)
+
 # Telegram bot tokens: [bot]<digits>:<token>, token >= 30 chars. The lookbehind
 # anchors the id at the start of its digit run: without it, a long run of digits
 # with no ":<token>" after it (a Unity/YAML ``_typelessdata`` blob in a 2 MB PR
@@ -943,6 +956,7 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
+        text = _PROSE_SECRET_LABEL_RE.sub(lambda m: m.group(1) + _mask_token(m.group(2)), text)
         text = _TELEGRAM_RE.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}:***", text)
 
     if "BEGIN" in text and "-----" in text:

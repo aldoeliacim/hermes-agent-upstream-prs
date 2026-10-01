@@ -7,9 +7,11 @@ import mimetypes
 import os
 import platform
 import re
+import secrets
 import signal
 import subprocess
 from contextlib import suppress
+from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
@@ -186,7 +188,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, SUPPORTED_DOCUMENT_TYPES, cache_image_from_url, cache_audio_from_url,
 )
 from gateway.platforms.helpers import cancel_task
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from utils import env_int
 
 
@@ -216,6 +218,41 @@ def _file_content_hash(path: Path) -> str:
         return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
     except OSError:
         return ""
+
+
+# Bridge source files whose integrity the running bridge advertises via the
+# /health ``scriptHash``. Must mirror scripts/whatsapp-bridge/bridge_helpers.js
+# BRIDGE_SOURCE_FILES exactly. Hashing bridge.js alone let a helper-module edit
+# slip past the reuse check, so a stale process kept serving old helper code.
+_BRIDGE_SOURCE_FILES = (
+    "allowlist.js",
+    "bridge.js",
+    "bridge_helpers.js",
+    "outbound_ids.js",
+    "owner_message_gate.js",
+)
+
+
+def _bridge_source_hash(bridge_script: Path) -> str:
+    """Deterministic 16-hex-char digest over the bridge source files in bridge.js's dir.
+
+    Sorts names, feeds ``name\\0bytes\\0`` per file, skips missing files. MUST
+    match scripts/whatsapp-bridge/bridge_helpers.js:bridgeSourceHash byte-for-byte
+    -- a mismatch would make ``_reuse_running_bridge`` loop-restart the bridge.
+    """
+    import hashlib
+    bridge_dir = Path(bridge_script).parent
+    h = hashlib.sha256()
+    for name in sorted(_BRIDGE_SOURCE_FILES):
+        try:
+            data = (bridge_dir / name).read_bytes()
+        except OSError:
+            continue
+        h.update(name.encode("utf-8"))
+        h.update(b"\0")
+        h.update(data)
+        h.update(b"\0")
+    return h.hexdigest()[:16]
 
 
 def check_whatsapp_requirements() -> bool:
@@ -292,6 +329,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
+        # Per-spawn loopback capability token for the bridge's state-changing endpoints.
+        # Generated/loaded in _load_or_create_bridge_token() and passed to the bridge via
+        # WHATSAPP_BRIDGE_TOKEN; the adapter echoes it back in the X-Hermes-Bridge-Token header on
+        # every send. Persisted 0600 in the session dir so a bridge reused across gateway restarts
+        # (the scriptHash handshake) keeps the same token.
+        self._bridge_token: Optional[str] = None
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
@@ -348,10 +391,94 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         return False
 
     def _attach_to_bridge(self, managed_process) -> None:
-        import aiohttp
         self._bridge_process = managed_process
-        self._http_session = aiohttp.ClientSession()
+        self._http_session = self._new_bridge_http_session()
+        self._spawn_poll_task()
+
+    def _load_or_create_bridge_token(self) -> str:
+        """Return the loopback capability token for the bridge, creating and persisting one if needed.
+
+        Persisted 0600 in the session dir as ``bridge-token`` so a bridge that survives a gateway
+        restart (reused via the scriptHash handshake) keeps the same token the new adapter will
+        present. Regenerated only if the file is missing/empty/unreadable.
+        """
+        cached = getattr(self, "_bridge_token", None)
+        if cached:
+            return cached
+        token_path = self._session_path / "bridge-token"
+        try:
+            existing = token_path.read_text(encoding="utf-8").strip()
+            if existing:
+                self._bridge_token = existing
+                return existing
+        except (OSError, ValueError):
+            pass
+        token = secrets.token_urlsafe(32)
+        try:
+            self._session_path.mkdir(parents=True, exist_ok=True)
+            # Write 0600 BEFORE content so the secret is never briefly world-readable.
+            fd = os.open(str(token_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(fd, token.encode("utf-8"))
+            finally:
+                os.close(fd)
+        except OSError as e:
+            # Non-fatal: fall back to an in-memory token. A bridge reused across a restart would
+            # then 401 until it is recycled (scriptHash/tokenAuth handshake), which is the safe
+            # direction (fail closed, then heal).
+            logger.warning("[%s] Could not persist bridge token: %s", self.name, e)
+        self._bridge_token = token
+        return token
+
+    def _bridge_auth_headers(self) -> Dict[str, str]:
+        """Header dict carrying the capability token, or empty if none."""
+        token = self._bridge_token or self._load_or_create_bridge_token()
+        return {"X-Hermes-Bridge-Token": token} if token else {}
+
+    def _new_bridge_http_session(self):
+        """Create the adapter->bridge aiohttp session with the capability token pre-set as a default
+        header, so EVERY send/edit/media/typing call is authenticated without per-call-site changes."""
+        import aiohttp
+        return aiohttp.ClientSession(headers=self._bridge_auth_headers())
+
+    def _spawn_poll_task(self) -> None:
+        """Start the inbound poll task under a done-callback supervisor.
+
+        The poll task is the adapter's ONLY inbound path. As a bare create_task it was
+        unsupervised: an exception escaping the loop — or the loop returning while the adapter
+        still believed it was running — left the adapter 'connected' but deaf, silently
+        dropping every inbound message until a full restart. The supervisor restarts the task
+        on any non-orderly termination.
+        """
         self._poll_task = asyncio.create_task(self._poll_messages())
+        self._poll_task.add_done_callback(self._on_poll_task_done)
+
+    def _on_poll_task_done(self, task: "asyncio.Task") -> None:
+        """Restart the poll task if it ended unexpectedly while the adapter is live.
+
+        Orderly stops — cancellation, ``_shutting_down``, or ``_running`` already cleared — are
+        left alone. Everything else (an escaped exception, or an unexpected clean return) means
+        the sole inbound path just went dark, so respawn it rather than fail silent.
+        """
+        if task is not self._poll_task:
+            # Superseded by a newer task (e.g. reconnect); ignore this stale callback.
+            # Retrieve any exception so a stale crash does not surface as an
+            # "exception was never retrieved" warning during an orderly handover.
+            if not task.cancelled():
+                task.exception()
+            return
+        if task.cancelled():
+            return  # cancellation is orderly (disconnect cancels the task); stay quiet
+        exc = task.exception()
+        if getattr(self, "_shutting_down", False) or not getattr(self, "_running", False):
+            # Orderly stop: adapter is shutting down or already stopped. `exc` has been
+            # retrieved above, so no unretrieved-exception warning leaks. Do not respawn.
+            return
+        if exc is not None:
+            logger.error("[%s] inbound poll task died (%s); respawning", self.name, exc)
+        else:
+            logger.warning("[%s] inbound poll task returned unexpectedly while running; respawning", self.name)
+        self._spawn_poll_task()
 
     async def _reuse_running_bridge(self, bridge_path: Path) -> bool:
         """Adopt a connected bridge serving the on-disk bridge.js + same read-receipt config; else say why it restarts."""
@@ -363,14 +490,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if bridge_status != "connected":
                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
                 return False
-            running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
-            if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
+            running_hash, disk_hash = data.get("scriptHash", ""), _bridge_source_hash(bridge_path)
+            # Reuse only if the running bridge ALSO enforces token auth (tokenAuth:true). A pre-token
+            # bridge is treated as stale so it gets recycled with a fresh token instead of serving
+            # unauthenticated forever — this is what makes enforce-from-start safe with zero send
+            # outage. Ensure our own token file exists so the reused-bridge session presents it.
+            running_token_auth = bool(data.get("tokenAuth"))
+            if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts and running_token_auth:
+                self._load_or_create_bridge_token()  # ensure the session header is populated
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
                 self._wire_plugin_handlers(None)
                 return True
-            stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}" if running_hash != disk_hash else "send_read_receipts config changed"
+            if running_hash != disk_hash:
+                stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}"
+            elif not running_token_auth:
+                stale_reason = "running bridge does not enforce capability token (pre-token), recycling with a fresh token"
+            else:
+                stale_reason = "send_read_receipts config changed"
             print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
         except Exception:
             pass  # Bridge not running, start a new one
@@ -408,6 +546,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # Without these the bridge hardcodes ~/.hermes/{image,audio,document}_cache (wrong under HERMES_HOME/profiles/cache layout).
         img_dir, audio_dir, _video_dir, doc_dir = _cache_dirs()
         bridge_env.update(HERMES_IMAGE_CACHE_DIR=str(img_dir), HERMES_AUDIO_CACHE_DIR=str(audio_dir), HERMES_DOCUMENT_CACHE_DIR=str(doc_dir))
+        # Per-spawn loopback capability token. Passed to the bridge so it enforces the
+        # X-Hermes-Bridge-Token gate on state-changing endpoints; the adapter's session presents the
+        # same token. Generated/loaded 0600 in the session dir. WHATSAPP_BRIDGE_TOKEN is blocklisted
+        # from the terminal / execute_code subprocess env so the agent's own shell can't read it and
+        # hand-roll an unauthenticated bridge POST with an arbitrary chatId.
+        bridge_env["WHATSAPP_BRIDGE_TOKEN"] = self._load_or_create_bridge_token()
         return bridge_env
 
     def _bridge_died(self, detail: str) -> bool:
@@ -627,7 +771,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         jid = to_whatsapp_jid(chat_id)
         payload: Dict[str, Any] = {"chatId": jid, "filePath": file_path, "mediaType": media_type}
         payload.update({k: v for k, v in (("caption", caption), ("fileName", file_name)) if v})
-        result = await self._post_bridge_message("send-media", payload, timeout=120)
+        # Size-aware upload timeout: video/document POSTs to WhatsApp's CDN can legitimately take
+        # minutes on a slow uplink. A fixed 120s ceiling dropped every large video/doc.
+        media_upload_timeout_ms = self._media_upload_timeout_ms(file_path, media_type)
+        payload["mediaUploadTimeoutMs"] = media_upload_timeout_ms
+        result = await self._post_bridge_message("send-media", payload, timeout=(media_upload_timeout_ms / 1000) + 30)
         if result.success and result.message_id:
             # A later quote of this attachment carries only a thumbnail stub; the bridge's cache
             # knows inbound media only, so index our own sends (the cron-delivered image case).
@@ -636,11 +784,99 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             await rich_sent_store.record_media_async(jid, result.message_id, [(file_path, mime or "application/octet-stream")])
         return result
 
+    @staticmethod
+    def _media_upload_timeout_ms(file_path: str, media_type: str) -> int:
+        """Size- and type-aware upload timeout (ms) for a media POST to the bridge.
+
+        Floors: 120s for image/audio, 300s for video/document (larger, slower CDN uploads).
+        Above the floor the budget scales ~30s per MB, hard-capped at 900s so a wildly large or
+        wrongly-sized file can never hang a send indefinitely. A missing/unstattable file falls
+        back to the type floor rather than raising.
+        """
+        try:
+            size_mb = os.path.getsize(file_path) / (1024 * 1024)
+        except OSError:
+            size_mb = 0.0
+        floor = 300_000 if media_type in {"video", "document"} else 120_000
+        scaled = int(60_000 + (size_mb * 30_000))
+        return max(floor, min(scaled, 900_000))
+
     @_needs_bridge
     async def send_poll(self, chat_id: str, question: str, options: list[str], *, selectable_count: int = 1) -> SendResult:
         """Native WhatsApp poll (low-level transport primitive; approval UX stays gateway-owned)."""
         payload: Dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "question": question, "options": list(options or []), "selectableCount": selectable_count}
         return await self._post_bridge_message("send-poll", payload, timeout=30)
+
+    # ── Reactions (declares INTO gateway.platforms.base reaction contract) ────
+    # base.py owns the one contract: supports_reactions is a capability FLAG and
+    # react()/unreact() are the two verbs. The bridge owns the Baileys protocol
+    # ({react: {text, key}}); this is the client half. An empty emoji retracts,
+    # which is how Baileys models removal, so unreact is the same /react call with
+    # an empty text rather than a second endpoint.
+    supports_reactions: bool = True
+
+    async def _post_reaction(self, chat_id: str, message_id: Optional[str], emoji: str) -> bool:
+        """POST to the bridge's ``/react``. An empty ``emoji`` retracts a prior reaction.
+
+        A missing ``message_id`` lets the bridge target the chat's most recent
+        inbound message, matching its documented fallback. Fails closed (False,
+        never an exception) so a caller can safely gate on the return.
+        """
+        if await self._bridge_unavailable():
+            return False
+        payload: Dict[str, Any] = {"chatId": to_whatsapp_jid(chat_id), "emoji": emoji}
+        if message_id:
+            payload["messageId"] = str(message_id)
+        try:
+            async with self._bridge_req("post", "react", 15, json=payload) as resp:
+                if resp.status == 200:
+                    return True
+                logger.debug("WhatsApp react failed (%s) for %s", resp.status, chat_id)
+        except Exception as e:
+            logger.debug("WhatsApp react raised for %s: %s", chat_id, e)
+        return False
+
+    async def react(self, chat_id: str, message_id: str, emoji: str) -> bool:
+        return await self._post_reaction(chat_id, message_id, emoji)
+
+    async def unreact(self, chat_id: str, message_id: str, emoji: str = "") -> bool:
+        return await self._post_reaction(chat_id, message_id, "")
+
+    # ── Processing-reaction ack ─────────────────────────────────────────────
+    # WhatsApp keeps ONE reaction per sender per message: a new /react replaces the
+    # previous one, so the start→outcome swap is a single set, never a stack. The
+    # emoji comes from the base picker (``display.processing_reaction``); a
+    # suppressed turn (mode off, or a reply-gated free-response group that may stay
+    # silent) gets no reaction at all. ``extra.reactions`` is the per-platform enable
+    # gate. It defaults OFF here: WhatsApp gained processing reactions in this layer,
+    # and a surface that never reacted must not start reacting on upgrade unasked.
+    def _reactions_enabled(self) -> bool:
+        configured = self.config.extra.get("reactions")
+        if configured is None:
+            return False
+        return str(configured).strip().lower() in {"true", "1", "yes", "on"}
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        if not self._reactions_enabled():
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        emoji = self._processing_ack_emoji(event)
+        if chat_id and message_id and emoji:
+            await self._post_reaction(chat_id, message_id, emoji)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
+        if not self._reactions_enabled() or self._processing_reaction_suppressed(event):
+            return
+        chat_id = getattr(event.source, "chat_id", None)
+        message_id = getattr(event, "message_id", None)
+        if not (chat_id and message_id):
+            return
+        if outcome == ProcessingOutcome.CANCELLED:
+            await self._post_reaction(chat_id, message_id, "")
+            return
+        await self._post_reaction(
+            chat_id, message_id, self._processing_outcome_emoji(event, outcome == ProcessingOutcome.SUCCESS))
 
     async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str, session_key: str,
                            metadata: Optional[Dict[str, Any]] = None) -> SendResult:
@@ -713,6 +949,81 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             print(f"[{self.name}] {bridge_exit}")
         return bool(bridge_exit)
 
+    # ── Passive event observation (reactions, polls) ──────────────────────
+    # A bare reaction/poll event CANNOT be a request — it carries no text the agent could
+    # answer, and that holds in EVERY chat type. So the observe-vs-dispatch decision keys on
+    # the EVENT's media type, not the chat's shape: these types are persisted as attributed
+    # transcript context (the next real turn sees them in history) and never wake the agent.
+    # That subsumes the reply-gate for this whole class — the agent is never asked to "decide
+    # silence" on a reaction, so it can never leak a stay-silent narration to any chat.
+    # Config kill-switch: whatsapp.observe_passive_events: false restores full dispatch.
+    _PASSIVE_MEDIA_TYPES = frozenset({"reaction", "poll", "poll_update"})
+
+    def _should_observe_passive_event(self, data: Dict[str, Any], event: MessageEvent) -> bool:
+        """True when this inbound event is passive signal, not a request.
+
+        EXCEPTION — a vote on a poll THIS AGENT asked: a clarify rendered as a native poll is
+        a question the agent is *blocked on*, so the vote is its answer, not ambient signal.
+        Swallowing it means the agent waits out the clarify timeout and reports "user did not
+        respond" while the user is looking at their own recorded vote.
+        """
+        media_type = str(data.get("mediaType", "") or "")
+        if media_type not in self._PASSIVE_MEDIA_TYPES:
+            return False
+        if media_type == "poll_update" and self._resolves_pending_clarify(data, event):
+            return False
+        configured = self.config.extra.get("observe_passive_events", True)
+        if isinstance(configured, str):
+            configured = configured.lower() in {"true", "1", "yes", "on"}
+        return bool(configured)
+
+    def _resolves_pending_clarify(self, data: Dict[str, Any], event: MessageEvent) -> bool:
+        """True when this poll vote answers a clarify the agent is blocked on.
+
+        The session key is derived through the bound session store — the same object and the
+        same ``event.source`` ``_observe_passive_event`` uses — so it cannot drift from the key
+        the gateway registered the clarify under. Fail-open: any error means "not a clarify
+        answer", i.e. the event stays passive exactly as before this check existed.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            return False
+        try:
+            from tools.clarify_gateway import get_pending_for_session
+
+            session_key = store._generate_session_key(event.source)
+            return bool(session_key) and bool(get_pending_for_session(session_key, include_choice_prompts=True))
+        except Exception:
+            logger.debug("[%s] clarify-pending check failed; treating poll vote as passive", self.name, exc_info=True)
+            return False
+
+    def _observe_passive_event(self, event: MessageEvent) -> None:
+        """Append a passive event to the session transcript, undelivered.
+
+        The next real turn SHOULD see reactions/votes as ordinary history — the point is only
+        that they don't wake the agent themselves. Fail-open: on any error the event is simply
+        not recorded; the reaction was passive signal to begin with, and this must never crash
+        the poll loop that sits above it.
+        """
+        store = getattr(self, "_session_store", None)
+        if store is None:
+            logger.debug("[%s] passive group event dropped (no session store bound)", self.name)
+            return
+        try:
+            session_entry = store.get_or_create_session(event.source)
+            sender = event.source.user_name or event.source.user_id or "unknown"
+            entry = {
+                "role": "user", "content": f"[{sender}] {event.text or ''}".strip(),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(), "observed": True,
+            }
+            if event.message_id:
+                entry["message_id"] = str(event.message_id)
+            store.append_to_transcript(session_entry.session_id, entry)
+            logger.info("[%s] passive group event observed (no agent turn): chat=%s type=%s",
+                        self.name, event.source.chat_id or "unknown", (event.text or "")[:40])
+        except Exception as exc:
+            logger.warning("[%s] failed to observe passive group event: %s", self.name, exc)
+
     async def _poll_messages(self) -> None:
         while self._running:
             if not self._http_session or await self._report_bridge_exit():
@@ -725,7 +1036,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                             if event:
                                 # Fire-and-forget: a slow bridge /read must not delay dispatch.
                                 asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
+                                if self._should_observe_passive_event(msg_data, event):
+                                    # Zero-conversational-content events (bare reactions,
+                                    # poll creations/votes) are CONTEXT, not requests: record
+                                    # them in the transcript without waking the agent.
+                                    self._observe_passive_event(event)
+                                elif event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
                                     await self.handle_message(event)
@@ -887,9 +1203,19 @@ _WA_EXT_MEDIA_TYPE = {
 }
 
 
-def _bridge_media_type(file_path: str, is_voice: bool, force_document: bool) -> str:
-    """Local file → bridge ``mediaType`` (image|video|audio|document); ``force_document`` = the [[as_document]] directive."""
-    return "document" if force_document else "audio" if is_voice else _WA_EXT_MEDIA_TYPE.get(os.path.splitext(file_path)[1].lower(), "document")
+def _bridge_media_type(file_path: str, is_voice: bool, force_document: bool, as_sticker: bool = False) -> str:
+    """Local file → bridge ``mediaType`` (image|video|audio|document|sticker); ``force_document`` = the [[as_document]] directive.
+
+    ``as_sticker`` is the ``[[as_sticker]]`` directive — deliberately an explicit
+    caller decision rather than an extension sniff, so an ordinary ``.webp`` a
+    user attaches still gets an image bubble. ``force_document`` wins over it,
+    matching the escape-hatch precedence ``[[as_document]]`` already has.
+    """
+    if force_document:
+        return "document"
+    if as_sticker:
+        return "sticker"
+    return "audio" if is_voice else _WA_EXT_MEDIA_TYPE.get(os.path.splitext(file_path)[1].lower(), "document")
 
 
 def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
@@ -897,15 +1223,32 @@ def _normalize_outbound_mentions(mentions: list[str] | None) -> list[str]:
     return list(dict.fromkeys(jid for m in mentions or () if (jid := normalize_whatsapp_mention_jid(m))))
 
 
+def _load_standalone_bridge_token(extra: Dict[str, Any]) -> Optional[str]:
+    """Read the bridge capability token for out-of-process (cron) sends. READ-ONLY.
+
+    The live adapter is the sole writer of the token file; a standalone sender must never create
+    one (a freshly-minted token would not match the running bridge and would 401 every send).
+    Returns None if no token has been persisted, in which case the bridge — if it too has no token —
+    accepts unauthenticated loopback calls as before.
+    """
+    session_path = Path(extra.get("session_path", get_hermes_dir("platforms/whatsapp/session", "whatsapp/session")))
+    try:
+        token = (session_path / "bridge-token").read_text(encoding="utf-8").strip()
+        return token or None
+    except OSError:
+        return None
+
+
 async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
-                           caption=None, mentions=None):
+                           caption=None, mentions=None, as_sticker=False):
     """Out-of-process delivery via the bridge HTTP API (standalone_sender_fn: cron apart from the gateway); ``caption`` rides on the media bubble."""
     try:
         import aiohttp
     except ImportError:
         return send_error("aiohttp not installed. Run: pip install aiohttp")
     try:
-        bridge_port = (getattr(pconfig, "extra", {}) or {}).get("bridge_port", 3000)
+        extra = getattr(pconfig, "extra", {}) or {}
+        bridge_port = extra.get("bridge_port", 3000)
         normalized_chat_id = to_whatsapp_jid(chat_id)
         media = media_files or []
         # A caption only applies to a single media file — never repeat it across a multi-file send.
@@ -920,7 +1263,12 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
             return payload
 
         last_message_id = None
-        async with aiohttp.ClientSession() as session:
+        # Present the loopback capability token if the live adapter persisted one; a standalone
+        # (cron) sender only READS it — it must never mint a token, since a token minted here would
+        # not match the running bridge and would 401 every send.
+        _standalone_token = _load_standalone_bridge_token(extra)
+        _standalone_headers = {"X-Hermes-Bridge-Token": _standalone_token} if _standalone_token else {}
+        async with aiohttp.ClientSession(headers=_standalone_headers) as session:
             if pending_mentions:
                 async with session.get(
                     f"http://localhost:{bridge_port}/health",
@@ -956,7 +1304,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
                         except Exception:
                             logger.warning("WhatsApp caption-fallback send failed for missing media")
                     return send_error(f"WhatsApp media file not found: {media_path}")
-                media_type = _bridge_media_type(media_path, is_voice, force_document)
+                media_type = _bridge_media_type(media_path, is_voice, force_document, as_sticker=as_sticker)
                 payload: Dict[str, Any] = {"chatId": normalized_chat_id, "filePath": media_path, "mediaType": media_type}
                 payload.update({k: v for k, v in (("fileName", os.path.basename(media_path) if media_type == "document" else None), ("caption", media_caption)) if v})
                 payload = _mention_first_payload(payload)
@@ -1023,12 +1371,64 @@ def _is_connected(config) -> bool:
 
 
 
+def _build_adapter(config):
+    """Factory wrapper that constructs WhatsAppAdapter from a PlatformConfig.
+
+    A single construction seam so registration wiring (and future config
+    normalization) has one place to hook without touching register() call sites.
+    """
+    return WhatsAppAdapter(config)
+
+
 def register(ctx) -> None:
     ctx.register_platform(
-        name="whatsapp", label="WhatsApp", adapter_factory=WhatsAppAdapter, check_fn=check_whatsapp_requirements,
+        name="whatsapp", label="WhatsApp", adapter_factory=_build_adapter, check_fn=check_whatsapp_requirements,
         is_connected=_is_connected, required_env=["WHATSAPP_ENABLED"],
         install_hint="WhatsApp requires a Node.js bridge — see the WhatsApp messaging docs",
         setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, allowed_users_env="WHATSAPP_ALLOWED_USERS",
         allow_all_env="WHATSAPP_ALLOW_ALL_USERS", cron_deliver_env_var="WHATSAPP_HOME_CHANNEL",
         standalone_sender_fn=_standalone_send, max_message_length=4096, emoji="💬", allow_update_command=True,
     )
+
+# ──────────────────────────────────────────────────────────────────────────
+# Re-homed from the local layer (2026-09-17 structured port): _whatsapp_media_type_for_message
+# ──────────────────────────────────────────────────────────────────────────
+
+def _whatsapp_media_type_for_message(
+    msg_type: "MessageType",
+    path: str,
+    bridge_mime: str = "",
+) -> str:
+    """Resolve the per-attachment MIME the gateway routes on.
+
+    The gateway classifies each attachment by its OWN MIME
+    (``_event_media_is_image`` et al.) and only consults the message-level
+    type when that MIME is empty. A sticker's message-level type is
+    ``STICKER`` — which is not ``PHOTO`` — so an empty/``"unknown"`` MIME
+    made the gateway treat a perfectly good WebP as an opaque document and
+    emit "[The user sent a document: sticker_….webp]" instead of showing
+    the model the pixels.
+
+    Stickers are images. Naming that here (rather than adding a STICKER arm
+    to every consumer downstream) keeps the fix at the single point where
+    the type is decided.
+    """
+    bridge_mime = (bridge_mime or "").strip()
+    ext = os.path.splitext(path)[1].lower()
+
+    if msg_type == MessageType.STICKER:
+        # WhatsApp stickers are always WebP; trust the bridge's MIME when it
+        # supplied one, but never fall through to "unknown".
+        return bridge_mime or "image/webp"
+    if msg_type == MessageType.PHOTO:
+        return bridge_mime or "image/jpeg"
+    if msg_type == MessageType.VOICE:
+        return bridge_mime or "audio/ogg"
+    if msg_type == MessageType.AUDIO:
+        return bridge_mime or "audio/mpeg"
+    if msg_type == MessageType.VIDEO:
+        return bridge_mime or "video/mp4"
+    if msg_type == MessageType.DOCUMENT:
+        return bridge_mime or SUPPORTED_DOCUMENT_TYPES.get(ext, "application/octet-stream")
+    return bridge_mime or "unknown"
+

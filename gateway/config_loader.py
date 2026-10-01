@@ -403,6 +403,18 @@ def read_yaml_layers(home: Path) -> dict:
     # apply_managed_overlay itself and must not be re-resolved (config_effective._effective order).
     yaml_cfg = _expand_env_vars(yaml_cfg)
 
+    # Expand ``${VAR}`` / ``${env:VAR}`` references exactly as
+    # ``hermes_cli.config.load_config`` does. This loader builds its own dict
+    # from the raw YAML, so without this a route secret written as
+    # ``secret: ${SEERR_WEBHOOK_SECRET}`` reached the webhook adapter as the
+    # literal placeholder and every delivery was rejected as unsigned —
+    # silently, because "wrong secret" and "unexpanded secret" look the same on
+    # the wire. Unresolved refs stay verbatim so startup can still report them.
+    from hermes_cli.config import _expand_env_vars
+    yaml_cfg = _expand_env_vars(yaml_cfg)
+    if not isinstance(yaml_cfg, dict):
+        yaml_cfg = {}
+
     # Managed scope: overlay administrator-pinned values (this loader bypasses
     # hermes_cli.config.load_config, so managed quick_commands / stt would otherwise be ignored).
     from hermes_cli import managed_scope

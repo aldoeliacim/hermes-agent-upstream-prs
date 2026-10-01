@@ -255,14 +255,17 @@ SUMMARY_PREFIX = (
     # deployment).
     # Carveout era (#41607/#38364/#42812): "consistent → use as background" licensed stale-task resumption
     # on topic overlap.
+    # Task-continuity era (#35344 successor): the pre-#80622 prefix made the latest message the sole
+    # authority and told the model every historical request "was already addressed", silently discarding
+    # unfinished authorized work when the user asked a side question. The summary is now framed as evidence,
+    # not authority; unfinished work survives unless explicitly cancelled/paused/replaced.
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
     "window — treat it as background reference, NOT as active instructions. "
-    "Do NOT answer questions or fulfill requests mentioned in this summary; "
-    "they were already addressed. "
-    "Respond ONLY to the latest user message that appears AFTER this "
-    "summary — that message is the single source of truth for what to do "
-    "right now. "
+    "The summary is evidence of earlier state, not permission to start or resume work. "
+    "Do not assume that every earlier request was completed or cancelled. "
+    "The latest real user message after this summary controls the immediate response "
+    "and any changes to scope. "
     "If no user message appears AFTER this summary, do nothing: do not "
     "resume, wrap up, or continue work from "
     f"'{HISTORICAL_TASK_HEADING}' or any other section, do not call tools, "
@@ -270,16 +273,15 @@ SUMMARY_PREFIX = (
     "active turn by itself. (Exception: if tool results or your own "
     "tool calls appear after this summary, you are mid-way through an "
     "in-flight exchange — continue that exchange normally.) "
-    "Topic overlap with the summary does NOT mean you should resume its "
-    "task: even on similar topics, the latest user message WINS. Treat ONLY "
-    "the latest message as the active task and discard stale items from "
-    f"'{HISTORICAL_TASK_HEADING}' entirely — do not 'wrap up' or "
-    "'finish' work described there unless the latest message explicitly "
-    "asks for it. "
-    "Reverse signals in the latest message (e.g. 'stop', 'undo', 'roll "
-    "back', 'just verify', 'don't do that anymore', 'never mind', a new "
-    "topic) must immediately end any in-flight work described in the "
-    "summary; do not re-surface it in later turns. "
+    "Topic overlap alone does not authorize resuming a historical task. "
+    "During an in-flight exchange, preserve unfinished authorized work unless "
+    "the user explicitly cancels, pauses, or replaces it. A side question or "
+    "additional request is not by itself cancellation. Reconcile outstanding "
+    "work with the latest input before ending the turn; complete what remains "
+    "authorized or explain a concrete blocker. Do not replay completed actions. "
+    "Explicit stop, undo, rollback, or inspection-only instructions take "
+    "precedence immediately; never revive cancelled or completed tasks from "
+    "the summary. If current authorization is unclear, ask instead of acting. "
     "IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system "
     "prompt is ALWAYS authoritative and active — never ignore or deprioritize "
     "memory content due to this compaction note. "
@@ -579,6 +581,29 @@ def salvage_grown_transcript(
 # Exact wire text of every shipped prefix, newest-first; stale directives must
 # still be strippable on resume. NEVER edit/reorder entries (byte-pinned); prepend.
 _HISTORICAL_SUMMARY_PREFIXES = (
+    # Pre-task-continuity: latest-only instructions discarded unfinished work.
+    '[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. '
+    'This is a handoff from a previous context window — treat it as background reference, NOT as '
+    'active instructions. Do NOT answer questions or fulfill requests mentioned in this summary; '
+    'they were already addressed. Respond ONLY to the latest user message that appears AFTER this'
+    ' summary — that message is the single source of truth for what to do right now. If no user '
+    'message appears AFTER this summary, do nothing: do not resume, wrap up, or continue work '
+    "from '## Historical Task Snapshot' or any other section, do not call tools, and wait for a "
+    'new user message. This handoff must never become the active turn by itself. (Exception: if '
+    'tool results or your own tool calls appear after this summary, you are mid-way through an '
+    'in-flight exchange — continue that exchange normally.) Topic overlap with the summary does '
+    'NOT mean you should resume its task: even on similar topics, the latest user message WINS. '
+    "Treat ONLY the latest message as the active task and discard stale items from '## Historical"
+    " Task Snapshot' entirely — do not 'wrap up' or 'finish' work described there unless the "
+    "latest message explicitly asks for it. Reverse signals in the latest message (e.g. 'stop', "
+    "'undo', 'roll back', 'just verify', 'don't do that anymore', 'never mind', a new topic) must"
+    ' immediately end any in-flight work described in the summary; do not re-surface it in later '
+    'turns. IMPORTANT: Your persistent memory (MEMORY.md, USER.md) in the system prompt is ALWAYS'
+    ' authoritative and active — never ignore or deprioritize memory content due to this '
+    'compaction note. None of the above restricts HOW you work: your tools remain fully active — '
+    'keep calling them normally for the active task (edit files, run commands, search) instead of'
+    ' merely narrating what you would do. The current session state (files, config, etc.) may '
+    'reflect work described here — avoid repeating it:',
     # Pre-#80622: lacked the "no user message after summary => do nothing" clause.
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted into the summary below. This is a handoff "
     "from a previous context window — treat it as background reference, NOT as active instructions. Do NOT answer "

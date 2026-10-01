@@ -69,6 +69,11 @@ def agent():
             skip_memory=True,
         )
         a.client = MagicMock()
+        # Tests here retarget this agent in place (provider/base_url/api_mode), which to the
+        # degraded-session self-heal looks like drift off the openrouter snapshot, so the next
+        # turn would rebuild a real client over the mock. No snapshot = nothing to self-heal
+        # to (its documented contract); the self-heal has its own suite.
+        a._primary_runtime = {}
         return a
 
 

@@ -2367,6 +2367,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         return False, ""
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _send_reaction(self, room_id: str, event_id: str, emoji: str) -> Optional[str]:
         """Send an emoji reaction; returns the reaction event_id, or None on failure."""
         if not self._client:
@@ -2402,14 +2405,16 @@ class MatrixAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         msg_id, room_id = event.message_id, event.source.chat_id
-        if self._reactions_enabled and msg_id and room_id:
-            reaction_event_id = await self._send_reaction(room_id, msg_id, "\U0001f440")
+        emoji = self._processing_ack_emoji(event)
+        if emoji and self._reactions_enabled and msg_id and room_id:
+            reaction_event_id = await self._send_reaction(room_id, msg_id, emoji)
             if reaction_event_id:
                 self._pending_reactions[(room_id, msg_id)] = reaction_event_id
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         msg_id, room_id = event.message_id, event.source.chat_id
-        if not self._reactions_enabled or not msg_id or not room_id or outcome == ProcessingOutcome.CANCELLED:
+        if (not self._reactions_enabled or not msg_id or not room_id or outcome == ProcessingOutcome.CANCELLED
+                or self._processing_reaction_suppressed(event)):
             return
         eyes_event_id = self._pending_reactions.pop((room_id, msg_id), None)
         if eyes_event_id:

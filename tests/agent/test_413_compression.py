@@ -363,6 +363,11 @@ class TestHTTP413Compression:
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        # This agent is BUILT for nvidia, so its primary snapshot must say so; otherwise the
+        # layer's degraded-session self-heal (restore_primary_runtime) sees live != primary and
+        # rebuilds a real client over the mock.
+        from agent.agent_init import _snapshot_primary_runtime
+        _snapshot_primary_runtime(agent)
         agent.client.chat.completions.create.side_effect = [err_400, ok_resp]
 
         with (
@@ -1356,6 +1361,10 @@ class TestPreflightCompression:
         agent.runtime_capabilities = {"native_compaction": True}
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        # Built for openai-codex: re-take the primary snapshot so the degraded-session
+        # self-heal does not treat this configuration as drift and rebuild the client.
+        from agent.agent_init import _snapshot_primary_runtime
+        _snapshot_primary_runtime(agent)
         # Exercise the idle pass too: it runs before threshold preflight and must honor
         # the same one-response checkpoint latch on a long-idle restored session.
         from agent.usage_anchor import capture_usage_anchor, set_usage_anchor

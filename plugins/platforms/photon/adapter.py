@@ -1261,6 +1261,9 @@ class PhotonAdapter(BasePlatformAdapter):
     def _reactions_enabled(self) -> bool:
         return _get_scoped_secret("PHOTON_REACTIONS", "false").strip().lower() in {"true", "1", "yes", "on"}
 
+    # Native reaction primitive (see the method below): declare it so callers
+    # gate on the contract instead of probing for a method that may not exist.
+    supports_reactions: bool = True
     async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Tapback ``emoji`` onto a message. Soft-fails (False), never raises."""
         return await self._sidecar_try(
@@ -1295,13 +1298,14 @@ class PhotonAdapter(BasePlatformAdapter):
         return {"success": True, "message_id": target}
 
     async def on_processing_start(self, event: MessageEvent) -> None:
-        """Tapback 👀 on the triggering message while the agent works."""
+        """Tapback a contextual reaction on the triggering message while the agent works."""
         if not self._reactions_enabled():
             return
         chat_id = getattr(event.source, "chat_id", None)
         message_id = getattr(event, "message_id", None)
-        if chat_id and message_id:
-            await self._add_reaction(chat_id, message_id, "\U0001f440")
+        emoji = self._processing_ack_emoji(event)
+        if chat_id and message_id and emoji:
+            await self._add_reaction(chat_id, message_id, emoji)
 
     # base.on_processing_complete swaps 👀 for 👍/👎 (remove-then-add keeps the sidecar's
     # reaction-handle slot coherent); CANCELLED leaves it unreacted.

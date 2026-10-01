@@ -151,6 +151,51 @@ class TestTakeCheckpoint:
         assert mgr.ensure_checkpoint("/", "root") is False
         assert mgr.ensure_checkpoint(str(Path.home()), "home") is False
 
+    def test_stale_index_lock_is_cleared_and_checkpoint_recovers(
+        self, mgr, work_dir, checkpoint_base,
+    ):
+        """An orphaned <index>.lock from a killed git must not wedge the
+        project forever: aged past _STALE_INDEX_LOCK_AGE it is removed on the
+        next git invocation and the checkpoint succeeds."""
+        from tools.checkpoint_manager import (
+            _STALE_INDEX_LOCK_AGE,
+            _index_path,
+        )
+
+        assert mgr.ensure_checkpoint(str(work_dir), "first") is True
+
+        store = _store_path(checkpoint_base)
+        index_file = _index_path(store, _project_hash(str(work_dir)))
+        lock = index_file.with_name(index_file.name + ".lock")
+
+        # Simulate a git killed mid-write: orphan lock, no living owner.
+        lock.write_bytes(b"")
+        old = time.time() - (_STALE_INDEX_LOCK_AGE + 60)
+        os.utime(lock, (old, old))
+
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('after crash')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "post-crash") is True
+        assert not lock.exists()
+
+    def test_fresh_index_lock_is_left_alone(self, mgr, work_dir, checkpoint_base):
+        """A young lock (possibly a live concurrent git) must NOT be removed;
+        the git call fails but the lock survives."""
+        from tools.checkpoint_manager import _index_path
+
+        assert mgr.ensure_checkpoint(str(work_dir), "first") is True
+
+        store = _store_path(checkpoint_base)
+        index_file = _index_path(store, _project_hash(str(work_dir)))
+        lock = index_file.with_name(index_file.name + ".lock")
+        lock.write_bytes(b"")  # mtime = now → under the age gate
+
+        mgr.new_turn()
+        (work_dir / "main.py").write_text("print('blocked')\n")
+        assert mgr.ensure_checkpoint(str(work_dir), "blocked") is False
+        assert lock.exists()
+        lock.unlink()
+
     def test_new_turn_resets_dedup_but_needs_changes(self, mgr, work_dir):
         assert mgr.ensure_checkpoint(str(work_dir), "turn 1") is True
         mgr.new_turn()

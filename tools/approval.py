@@ -26,6 +26,15 @@ from tools.approval_context import (
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
     _tirith_fail_open, get_current_session_key,
+    TurnDeliveryState,
+    get_current_message_source, set_current_message_source, reset_current_message_source,
+    is_owner_source,
+    get_turn_delivery_state, set_turn_delivery_state, reset_turn_delivery_state,
+    is_reply_tool_gated_turn, set_reply_tool_gated_turn, reset_reply_tool_gated_turn,
+    note_current_message_delivered, note_current_message_silent,
+    CronSilenceState,
+    get_cron_silence_state, set_cron_silence_state, reset_cron_silence_state,
+    note_cron_silence_decided,
 )
 from tools.approval_detection import (
     _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,

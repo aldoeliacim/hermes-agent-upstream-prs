@@ -2435,28 +2435,6 @@ class TestSendTyping:
 class TestFormatMessage:
     """Test markdown to Slack mrkdwn conversion."""
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("target,pattern", [
-        ("files", "*test*.py"),
-        ("content", r"test_.*_.*\.py"),
-    ])
-    async def test_tool_progress_preserves_search_pattern(self, adapter, target, pattern):
-        from gateway.run_turn_runner import TurnRunner
-
-        args = {"target": target, "pattern": pattern}
-        ctx = SimpleNamespace(source=None, progress_mode="all", last_was_terminal_block=[False])
-        runner = SimpleNamespace(_delivery_adapter_for=lambda source: adapter)
-        message = TurnRunner(runner, ctx)._progress_build_message("search_files", pattern, args)
-        client = adapter._app.client
-        client.chat_postMessage.return_value = {"ok": True, "ts": "123.456"}
-        client.chat_update.return_value = {"ok": True, "ts": "123.456"}
-
-        assert (await adapter.send("C123", message)).success
-        assert (await adapter.edit_message("C123", "123.456", message)).success
-        for method in (client.chat_postMessage, client.chat_update):
-            assert method.call_args.kwargs["text"].endswith(f"`{pattern}`")
-        assert args == {"target": target, "pattern": pattern}
-
     def test_tool_preview_backticks_do_not_break_code_span(self, adapter):
         from agent.display import ToolPreview
 

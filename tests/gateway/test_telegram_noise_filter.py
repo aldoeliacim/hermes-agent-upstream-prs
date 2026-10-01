@@ -177,6 +177,28 @@ def test_manual_compress_feedback_and_failure_notices_stay_visible(platform, mes
     assert _prepare_gateway_status_message(platform, "warn", message) == message
 
 
+@pytest.mark.parametrize("platform", ["whatsapp", "telegram", "slack"])
+def test_chat_delivery_suppresses_prefatory_internal_handoff(platform):
+    # Synthetic incident shape: no private client data in the regression fixture.
+    artifact = (
+        'The user said "OK" and the previous task is complete.\n\n'
+        'I need to output the full summary as the previous summary was an internal context handoff.\n'
+        '<summary>\n## Overview\nConfidential project note.\n## Current State\nArchived.\n</summary>'
+    )
+    assert _sanitize_gateway_final_response(platform, artifact) == ""
+    assert _sanitize_gateway_final_response(platform, "Thanks, noted.") == "Thanks, noted."
+
+
+@pytest.mark.parametrize("platform", ["whatsapp", "telegram", "slack"])
+def test_chat_delivery_blocks_summary_block_with_unusual_preface(platform):
+    artifact = (
+        'Acknowledged.\n\n<summary>\n## Overview\nPrivate synthetic note.\n'
+        '## Current State\nClosed.\n</summary>\n'
+        'For the next context window.'
+    )
+    assert _sanitize_gateway_final_response(platform, artifact) == ''
+
+
 @pytest.mark.parametrize("platform", ["slack", "matrix"])
 def test_chat_gateways_redact_secret_in_provider_error(platform):
     """Provider-error bodies carrying secrets must never reach chat users.

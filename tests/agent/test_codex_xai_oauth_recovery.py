@@ -460,6 +460,109 @@ def test_recover_with_credential_pool_rotates_on_xai_spending_limit_403():
     agent._swap_credential.assert_called_once_with(next_entry)
 
 
+def test_recover_with_credential_pool_rotates_entitlement_403_when_pool_has_next():
+    """An account-scoped entitlement-shaped 403 (e.g. Anthropic 'OAuth authentication is
+    currently not allowed for this organization') must first try to ROTATE to a healthy pooled
+    sibling before abandoning the provider. Refresh cannot fix an unentitled account, but another
+    pooled account may still be entitled. Only when no alternate exists does the error surface."""
+    from agent.error_classifier import FailoverReason
+
+    agent = _make_codex_agent()
+    agent.provider = "anthropic"
+    agent.api_mode = "anthropic_messages"
+    agent._swap_credential = MagicMock()
+
+    refresh_calls = {"n": 0}
+    rotated = MagicMock(id="next-anthropic-account")
+    mark_calls = []
+
+    class _FakePool:
+        provider = "anthropic"
+
+        def current(self):
+            return SimpleNamespace(id="current", runtime_api_key="test-key")
+
+        def try_refresh_matching(self, **_kwargs):
+            refresh_calls["n"] += 1
+            return MagicMock(id="should_not_be_called")
+
+        def entries(self):
+            return []
+
+        def mark_exhausted_and_rotate(self, **kwargs):
+            mark_calls.append(kwargs)
+            return rotated
+
+    agent._credential_pool = _FakePool()
+    error_context = {
+        "message": "OAuth authentication is currently not allowed for this organization.",
+    }
+
+    recovered, retried_429 = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context=error_context,
+    )
+
+    assert recovered is True
+    assert retried_429 is False
+    # Refresh must NOT be attempted for an entitlement 403 — the token is valid, the account
+    # simply lacks the entitlement.
+    assert refresh_calls["n"] == 0
+    assert len(mark_calls) == 1
+    assert mark_calls[0]["status_code"] == 403
+    assert mark_calls[0]["error_context"] == error_context
+    assert mark_calls[0]["api_key_hint"] == "test-key"
+    assert mark_calls[0]["failure_reason"] == "auth"
+    agent._swap_credential.assert_called_once_with(rotated)
+
+
+def test_recover_with_credential_pool_entitlement_403_surfaces_when_no_alternate():
+    """True no-alternate entitlement 403: rotation yields nothing, so recovery must return False
+    and let the real terminal error surface — never a silent false recovery, never a refresh loop."""
+    from agent.error_classifier import FailoverReason
+
+    agent = _make_codex_agent()
+    agent.provider = "anthropic"
+    agent.api_mode = "anthropic_messages"
+    agent._swap_credential = MagicMock()
+
+    refresh_calls = {"n": 0}
+
+    class _FakePool:
+        provider = "anthropic"
+
+        def current(self):
+            return SimpleNamespace(id="current", runtime_api_key="test-key")
+
+        def try_refresh_matching(self, **_kwargs):
+            refresh_calls["n"] += 1
+            return MagicMock(id="should_not_be_called")
+
+        def entries(self):
+            return []
+
+        def mark_exhausted_and_rotate(self, **_kwargs):
+            return None  # sole/unentitled pool — no healthy sibling to rotate to
+
+    agent._credential_pool = _FakePool()
+    error_context = {
+        "message": "OAuth authentication is currently not allowed for this organization.",
+    }
+
+    recovered, retried_429 = agent._recover_with_credential_pool(
+        status_code=403,
+        has_retried_429=False,
+        classified_reason=FailoverReason.auth,
+        error_context=error_context,
+    )
+
+    assert recovered is False
+    assert refresh_calls["n"] == 0
+    agent._swap_credential.assert_not_called()
+
+
 
 
 

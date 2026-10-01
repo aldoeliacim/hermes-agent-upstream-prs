@@ -126,14 +126,14 @@ def _canonical_capture_paths(turn_messages: List[Dict[str, Any]]) -> Dict[str, s
 
 
 def _repair_explicit_computer_use_media_paths_inner(response: str, messages: List[Dict[str, Any]], history_offset: int = 0) -> str:
-    if "MEDIA:" not in response:
+    # Lazy: keeps the import cheap for standalone cron processes that may never hit a delivery tag.
+    from gateway.platforms.base import BasePlatformAdapter, has_media_marker
+
+    if not has_media_marker(response):
         return response
     canonical_by_basename = _canonical_capture_paths(_current_turn_messages(messages, history_offset))
     if not canonical_by_basename:
         return response
-
-    # Lazy: keeps the import cheap for standalone cron processes that may never hit MEDIA:.
-    from gateway.platforms.base import BasePlatformAdapter
 
     repaired = response
     for emitted_path, _is_voice in BasePlatformAdapter.extract_media(response)[0]:

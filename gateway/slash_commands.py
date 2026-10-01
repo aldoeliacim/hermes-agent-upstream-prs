@@ -959,9 +959,16 @@ class GatewaySlashCommandsMixin(
         return EphemeralReply(t("gateway.yolo.enabled"))
 
     async def _handle_verbose_command(self, event: MessageEvent) -> str:
-        """Handle /verbose — cycle tool progress display mode (off → new → all → verbose → log) per
-        *current platform*, saved to ``display.platforms.<platform>.tool_progress``. Gated by
-        ``display.tool_progress_command`` (default off)."""
+        """Handle /verbose — toggle the surviving tool-progress sink for the *current platform*, saved
+        to ``display.platforms.<platform>.tool_progress``. Gated by ``display.tool_progress_command``
+        (default off).
+
+        Since #921 the edited/rewritten in-chat progress-acknowledgement bubble was removed, so the
+        legacy text modes (``new``/``all``/``verbose``) no longer render anything in chat. The only
+        values that still have an effect are ``log`` (tool calls appended to
+        ~/.hermes/logs/tool_calls.log, silent in chat) and ``off`` (also the Slack-native task-card
+        opt-out). This command now toggles between those two; any pre-existing legacy value is treated
+        as ``off`` for the toggle and is inert either way."""
         from gateway.run import _load_gateway_config
         config_path, platform_key = self._display_config_target(event)
         try:
@@ -972,11 +979,10 @@ class GatewaySlashCommandsMixin(
             gate_enabled = False
         if not gate_enabled:
             return t("gateway.verbose.not_enabled")
-        # Cycle mode (per-platform), reading the current effective mode via the resolver.
+        # Toggle the only sink that still does anything: log ↔ off. Legacy text modes are inert now.
         from gateway.display_config import resolve_display_setting
-        cycle = ["off", "new", "all", "verbose", "log"]
-        current = resolve_display_setting(user_config, platform_key, "tool_progress", "all")
-        new_mode = cycle[(cycle.index(current if current in cycle else "all") + 1) % len(cycle)]
+        current = resolve_display_setting(user_config, platform_key, "tool_progress", "off")
+        new_mode = "off" if current == "log" else "log"
         description = t(f"gateway.verbose.mode_{new_mode}")
         try:
             _write_raw_config_leaf(config_path, ("display", "platforms", platform_key, "tool_progress"), new_mode)
@@ -1188,6 +1194,45 @@ class GatewaySlashCommandsMixin(
         """Handle /approve — unblock waiting agent thread(s). They block inside tools/approval.py;
         signalling the event resumes them so the command executes inline (same flow as the CLI)."""
         from tools.approval import resolve_gateway_approval
+
+        source = event.source
+        gate_key = self._session_key_for_source(source)
+
+        # OWNER GATE — fail CLOSED: authorizing a dangerous command belongs to
+        # the gateway's primary owner only, never to a routed contact whose DM
+        # the agent happens to be working in. This single choke point covers
+        # BOTH the slash "/approve" and the bare-word "approve"/"yes" plain-text
+        # path (both reach this handler while an approval blocks). A stray
+        # approval from a non-owner is denied outright — never executed.
+        try:
+            from gateway.owner_authority import (
+                home_is_configured_for,
+                source_is_non_owner,
+            )
+
+            cfg = getattr(self, "config", None)
+            # Suppress ONLY when there is a distinct owner to protect: a home
+            # channel is configured for this source's platform AND the source is
+            # not that owner. In a single-user deployment that never ran /sethome
+            # (no home configured) there is no separate owner, so an authorized
+            # operator's /approve must keep working — mirrors the H4 notify-path
+            # suppression in run_turn_runner.py. Without this home guard, a bare
+            # source_is_non_owner() auto-DENIES every /approve on no-home deploys.
+            if home_is_configured_for(cfg, source) and source_is_non_owner(
+                cfg, source, session_key=gate_key
+            ):
+                logger.warning(
+                    "Ignoring /approve from non-owner silo (session_key=%s)", gate_key,
+                )
+                # Fail closed: deny anything pending, then report nothing to approve.
+                from tools.approval import has_blocking_approval
+
+                if has_blocking_approval(gate_key):
+                    resolve_gateway_approval(gate_key, "deny", resolve_all=True)
+                return t("gateway.approve.no_pending")
+        except Exception:
+            logger.debug("non-owner /approve gate check failed", exc_info=True)
+
         session_key, stale = self._blocking_approval_or_stale(event, "gateway.approval_expired",
                                                               "gateway.approve.no_pending")
         if stale:

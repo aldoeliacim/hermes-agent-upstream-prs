@@ -30,6 +30,33 @@ def _default_dispatch(task_id):
     return lambda tool_name, tool_args: handle_function_call(tool_name, tool_args, task_id=task_id)
 
 
+def _authority_dispatch(task_id, lifetime=None):
+    """Dispatcher that orders admission against retirement for one kernel slot.
+
+    A host tool call cannot be cancelled, so ordering is the only real protection: a
+    call is admitted under the slot's lock, which retirement also takes. It is either
+    admitted BEFORE retirement — and counted in ``users``, keeping the slot busy until
+    it returns — or refused after it. Without that ordering a call admitted before
+    retirement still runs afterwards, and the slot appears free while it does.
+    """
+    inner = _default_dispatch(task_id)
+    if lifetime is None:
+        return inner
+
+    def dispatch(tool_name, tool_args):
+        with lifetime.lock:
+            if lifetime.retired or lifetime.closed.is_set():
+                return tool_error("Remote cell authority retired")
+            lifetime.users += 1
+        try:
+            return inner(tool_name, tool_args)
+        finally:
+            with lifetime.lock:
+                lifetime.users = max(0, lifetime.users - 1)
+
+    return dispatch
+
+
 def _rpc_token_ok(request: dict, rpc_token: str) -> bool:
     """Constant-time token check; an empty server token fails closed. Compared as bytes:
     compare_digest raises TypeError on a non-ASCII str, and the token is script-supplied JSON."""
@@ -129,11 +156,17 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str):
+                   rpc_token: str, *, lifetime=None, dispatch=None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
-    thread. Malformed or unauthorized requests are removed without a response."""
-    dispatch = _default_dispatch(task_id)
+    thread. Malformed or unauthorized requests are removed without a response.
+
+    ``lifetime`` (optional) preserves the earlier slot-scoped admission contract. Persistent
+    remote kernels pass a cell-specific ``dispatch`` instead so retirement is atomic with that
+    cell's authority rather than with a reusable slot.
+    """
+    if dispatch is None:
+        dispatch = _authority_dispatch(task_id, lifetime)
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
