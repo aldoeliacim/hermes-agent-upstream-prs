@@ -68,6 +68,11 @@ def event(**changes):
                         message_id='1', source=SessionSource(**values))
 
 
+async def _async_hook_result(*_args, **_kwargs):
+    """Async stand-in for the awaited pre_gateway_dispatch hook."""
+    return []
+
+
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     from gateway.run import GatewayRunner
@@ -80,8 +85,11 @@ def runner(tmp_path, monkeypatch):
     r.adapters = {Platform.TELEGRAM: Sink()}
     r._handle_message_with_agent = AsyncMock(return_value='OWNER_PRIVATE_OK')
     r.hooks = SimpleNamespace(emit=AsyncMock())
-    r._private_hook = MagicMock(return_value=[])
-    monkeypatch.setattr('hermes_cli.plugins.invoke_hook', r._private_hook)
+    # Since #109196 the inbound path awaits pre_gateway_dispatch, so the seam is
+    # the ASYNC entry point (hermes_cli.plugins.ainvoke_hook) — patching the old
+    # sync symbol silently left _private_hook uncalled and this test went red.
+    r._private_hook = MagicMock(side_effect=_async_hook_result)
+    monkeypatch.setattr('hermes_cli.plugins.ainvoke_hook', r._private_hook)
     return r
 
 
