@@ -175,6 +175,23 @@ def _platform_default_toolset(platform: str) -> str:
     return PLATFORMS[platform]["default_toolset"] if platform in PLATFORMS else f"hermes-{platform}"
 
 
+def _is_registered_toolset(name: str) -> bool:
+    """True when ``name`` is a toolset the runtime can actually resolve.
+
+    A derived default (``hermes-<platform>``) is only a NAME until the registry
+    confirms it; ``Platform`` enum values such as ``relay``/``msgraph_webhook``
+    have no matching registry entry, so their derived name resolves to nothing.
+    """
+    try:
+        from toolsets import TOOLSETS, validate_toolset
+
+        if name in TOOLSETS:
+            return True
+        return validate_toolset(name) is not False
+    except Exception:
+        return False
+
+
 def _cfg_section(config: dict, key: str) -> dict:
     """Return ``config[key]`` as a dict, replacing a missing or non-dict value with ``{}``."""
     section = config.setdefault(key, {})
@@ -584,6 +601,20 @@ def _get_platform_tools(config: dict, platform: str, *, include_default_mcp_serv
     explicitly_configured = isinstance(toolset_names, list)
     if not explicitly_configured:
         toolset_names = [_platform_default_toolset(platform)]
+        # A platform with no PLATFORMS entry derives ``hermes-<platform>``, which is NOT
+        # necessarily a REGISTERED toolset: the Platform enum carries values the toolset
+        # registry never got (``relay``, ``msgraph_webhook``). Returning such a name yields a
+        # NON-EMPTY set naming a toolset that does not exist, and since callers hand that set
+        # straight to the agent as ``enabled_toolsets`` (a list, never None), the session
+        # silently runs with ZERO tools instead of failing loudly. Fall back to the cli
+        # default — real and registered — so the platform keeps a working tool surface.
+        if not _is_registered_toolset(toolset_names[0]):
+            logger.warning(
+                "platform %r has no registered default toolset (%r is not a known toolset); "
+                "falling back to the cli toolset so the session keeps its tools",
+                platform, toolset_names[0],
+            )
+            toolset_names = [_platform_default_toolset("cli")]
     # YAML may parse bare numeric names (``12306:``) as int; normalise so sorted() never mixes types.
     toolset_names = [str(ts) for ts in toolset_names]
 
