@@ -131,6 +131,32 @@ class WhatsAppBehaviorMixin(OwnAccessPolicyMixin):
                 return env, raw
         return None, None
 
+    def _warn_on_empty_allowlist(self) -> None:
+        """Report an ``allowlist`` policy paired with an EMPTY list.
+
+        ``GROUP_POLICY=allowlist`` reads like a securely-restricted configuration. Paired with
+        an empty ``WHATSAPP_GROUP_ALLOWED_USERS`` it instead rejects **100%** of group traffic,
+        and because the bridge destructively dequeues before the gate runs, each rejection
+        leaves no trace: no error, no log line, no retry. The same shape silently drops every
+        DM when ``WHATSAPP_ALLOWED_USERS`` is absent. Both configurations read as deliberate,
+        so they are only diagnosable by saying so out loud.
+        """
+        if self._group_policy == "allowlist" and not self._group_allow_from:
+            logger.warning(
+                "[%s] group_policy=allowlist but the group allowlist is EMPTY — every group "
+                "message will be dropped silently. Set WHATSAPP_GROUP_ALLOWED_USERS (or "
+                "group_allow_from) to the groups this bot should serve, or set "
+                "WHATSAPP_GROUP_POLICY=open/pairing.",
+                self.name,
+            )
+        if self._dm_policy == "allowlist" and not self._allow_from:
+            logger.warning(
+                "[%s] dm_policy=allowlist but WHATSAPP_ALLOWED_USERS is empty — every DM will "
+                "be dropped silently. Populate the allowlist or set "
+                "WHATSAPP_DM_POLICY=open/pairing.",
+                self.name,
+            )
+
     def _select_dm_allowlist(self, extra: Dict[str, Any], env_keys, read_env) -> Any:
         """Raw DM allowlist; records the winning source in ``_dm_allowlist_source`` so live DM checks keep
         the same precedence."""
