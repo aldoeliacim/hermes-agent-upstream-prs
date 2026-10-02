@@ -666,10 +666,14 @@ async function startSocket() {
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        // Status broadcasts are never processed, by anyone. Groups are NOT pre-filtered here:
+        // every other member's message in an allowlisted group IS forwarded, so dropping the
+        // owner's made them the only traffic in that group that never arrived. The group case
+        // is decided in `owner_message_gate.js` against the group allowlist.
+        if (chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
@@ -694,6 +698,13 @@ async function startSocket() {
             allowlistMatches: (id) => matchesAllowedUser(id, ALLOWED_USERS, SESSION_DIR),
             messageId: msg.key.id,
             chatId,
+            isGroup,
+            groupAllowed: isGroup && matchesInboundWhatsAppGroup({
+              chatId,
+              groupPolicy: WHATSAPP_GROUP_POLICY,
+              groupAllowedUsers: GROUP_ALLOWED_USERS,
+              sessionDir: SESSION_DIR,
+            }),
           });
           if (decision.action === 'drop_echo') continue;
           if (decision.action === 'drop_disabled') continue;

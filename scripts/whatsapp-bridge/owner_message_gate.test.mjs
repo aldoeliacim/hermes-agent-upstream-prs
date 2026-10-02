@@ -124,3 +124,62 @@ test('disabled flag fires before allowlist check', () => {
   });
   assert.deepEqual(decision, { action: 'drop_disabled' });
 });
+
+// --- groups -----------------------------------------------------------------
+// The owner's own message in an allowlisted group used to be dropped by a
+// caller-side pre-filter, before this gate ran. Every other member's message in
+// that same group was forwarded, so the owner's were the only traffic that never
+// arrived. Groups are decided here instead, against the GROUP allowlist.
+
+test('fromMe in an allowlisted group is forwarded without the DM opt-in', () => {
+  const decision = classifyOwnerMessageGate({
+    fromMe: true,
+    fromOwnerEnabled: false,          // DM opt-in deliberately off
+    recentlySent: new Set(),
+    allowlistMatches: () => false,    // DM allowlist irrelevant for a group
+    messageId: 'GROUPMSG1',
+    chatId: '5215514706713-1463600871@g.us',
+    isGroup: true,
+    groupAllowed: true,
+  });
+  assert.deepEqual(decision, { action: 'forward_owner' });
+});
+
+test('fromMe in a group that is NOT allowlisted is dropped (regression)', () => {
+  const decision = classifyOwnerMessageGate({
+    fromMe: true,
+    fromOwnerEnabled: true,
+    recentlySent: new Set(),
+    allowlistMatches: () => true,
+    messageId: 'GROUPMSG2',
+    chatId: '120363999999999999@g.us',
+    isGroup: true,
+    groupAllowed: false,
+  });
+  assert.deepEqual(decision, { action: 'drop_allowlist' });
+});
+
+test('group echo of our own /send is still dropped', () => {
+  const decision = classifyOwnerMessageGate({
+    fromMe: true,
+    fromOwnerEnabled: false,
+    recentlySent: new Set(['GROUPMSG3']),
+    allowlistMatches: () => false,
+    messageId: 'GROUPMSG3',
+    chatId: '5215514706713-1463600871@g.us',
+    isGroup: true,
+    groupAllowed: true,
+  });
+  assert.deepEqual(decision, { action: 'drop_echo' });
+});
+
+test('non-fromMe group traffic still passes through untouched', () => {
+  const decision = classifyOwnerMessageGate({
+    fromMe: false,
+    isGroup: true,
+    groupAllowed: false,
+    messageId: 'GROUPMSG4',
+    chatId: '120363999999999999@g.us',
+  });
+  assert.deepEqual(decision, { action: 'pass' });
+});
