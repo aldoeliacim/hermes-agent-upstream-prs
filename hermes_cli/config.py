@@ -1282,8 +1282,15 @@ def _persist_migration(config: Dict[str, Any]) -> None:
     """Persist a migrated config under THE migration write invariant: a migration may only
     persist values that DIFFER from the schema default, plus explicit removals/renames of user
     data. Every migration step MUST write through here (``save_config`` with default-stripping
-    ON, no ``merge_existing``) so the invariant cannot regress one migration at a time."""
-    save_config(config)
+    ON, no ``merge_existing``) so the invariant cannot regress one migration at a time.
+
+    ``allow_collapse`` is sound, not a bypass: every step starts from ``read_raw_config()`` — the
+    COMPLETE on-disk document — and edits it in place, so this write is whole-file by construction
+    and knows every key it carries. A migration renames/removes a few keys and cannot drop a
+    section by accident; if one ever did, that is a bug in the step, and it now surfaces in the
+    migration log instead of silently eating the user's config.
+    """
+    save_config(config, allow_collapse="config migration (whole-file, edits read_raw_config in place)")
 
 
 def _prompt_and_save_env(name: str, info: Dict[str, Any], prompt: str, results: Dict[str, Any]) -> bool:
@@ -2013,16 +2020,48 @@ def require_readable_config_before_write(config_path: Optional[Path] = None) -> 
     return loaded
 
 
-def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_content_on_create: Optional[str] = None) -> None:
+def atomic_config_write(config_path: Path, data: Dict[str, Any], *, extra_content_on_create: Optional[str] = None,
+                        allow_collapse: Optional[str] = None) -> None:
     """THE ``config.yaml`` writer: fail-closed (``require_readable_config_before_write``) and
     comment-preserving (ruamel round-trip merge of *data* onto the on-disk document). Every code
     path that persists a config.yaml — ``save_config``, ``config set``, migrations, plugin
     bookkeeping, gateway/TUI RPCs, auth resets — goes through here; a PyYAML dump of a config
-    path anywhere else is rejected by ``scripts/check_config_yaml_writers.py`` (#92554)."""
+    path anywhere else is rejected by ``scripts/check_config_yaml_writers.py`` (#92554).
+
+    Also fail-closed against silent mass loss: the round-trip merge deletes keys the caller
+    omitted, so a caller holding only part of the config would erase the rest. ``allow_collapse``
+    is the escape hatch for a deliberate full replacement; it is logged, never silent (#113301)."""
     from utils import atomic_roundtrip_yaml_save
+    from hermes_cli.config_collapse_guard import guard_against_config_collapse
 
     _refuse_failed_read(config_path, data)
+    refusal = guard_against_config_collapse(
+        config_path, _read_existing_for_guard(config_path), data, allow=allow_collapse)
+    if refusal:
+        raise RuntimeError(refusal)
+    # Snapshot BEFORE the write. The ``good`` backups taken at load time only capture a file that
+    # already parsed, so after a destructive write the entire trail is copies of the casualty
+    # (2026-10-03: every ``config.yaml.good.*`` was 1.9 KB of an already-collapsed config). This
+    # copy is taken while the previous state is still intact, so it is actually restorable.
+    _backup_before_write(config_path)
     atomic_roundtrip_yaml_save(config_path, data, extra_content_on_create=extra_content_on_create)
+
+
+def _backup_before_write(config_path: Path) -> None:
+    """Pre-write copy under ``backups/config/``; best effort, never blocks the write."""
+    try:
+        from hermes_cli.config_backups import backup_config
+        backup_config(config_path, "pre-write")
+    except Exception as exc:  # noqa: BLE001 - a backup failure must not break the save
+        logger.warning("Pre-write backup of %s failed: %s", config_path, exc)
+
+
+def _read_existing_for_guard(config_path: Path) -> Optional[Dict[str, Any]]:
+    """The on-disk document for the collapse guard, or None when it can't be parsed."""
+    from hermes_cli.config_collapse_guard import _read_yaml_mapping
+    if not config_path.is_file():
+        return None
+    return _read_yaml_mapping(config_path)
 
 
 def load_config() -> Dict[str, Any]:
@@ -2405,12 +2444,17 @@ def _commented_sections_for_save(normalized: Dict[str, Any]) -> Optional[str]:
 
 def save_config(
     config: Dict[str, Any], *, strip_defaults: bool = True,
-    preserve_keys: Optional[Set[Tuple[str, ...]]] = None, merge_existing: bool = False):
+    preserve_keys: Optional[Set[Tuple[str, ...]]] = None, merge_existing: bool = False,
+    allow_collapse: Optional[str] = None):
     """Save configuration to ~/.hermes/config.yaml.
     Schema defaults are not written unless the user explicitly set them (the path exists in the
     raw config before normalisation), so config.yaml is never contaminated with defaults that
     would hide future default changes. ``merge_existing`` deep-merges the on-disk raw config
-    under *config* so partial callers cannot drop sections they omitted."""
+    under *config* so partial callers cannot drop sections they omitted.
+
+    ``allow_collapse=<reason>`` is for a deliberately total replacement (restore, migration). It
+    bypasses the fail-closed mass-loss guard in :func:`atomic_config_write` and is logged as a
+    WARNING so the deletion stays attributable; never pass it to silence a surprise."""
     with _CONFIG_LOCK:
         if is_managed():
             managed_error("save configuration")
@@ -2442,7 +2486,8 @@ def save_config(
             effective_preserve_keys = _explicit_config_paths(_raw_for_paths) | set(preserve_keys or ())
             normalized = _strip_default_values(normalized, DEFAULT_CONFIG, preserve_keys=effective_preserve_keys)
 
-        atomic_config_write(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
+        atomic_config_write(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized),
+                            allow_collapse=allow_collapse)
         _secure_file(config_path)
         _RAW_CONFIG_CACHE.pop(str(config_path), None)
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
@@ -3445,9 +3490,14 @@ def _exit_invalid(msg: str) -> None:
 
 
 def _write_user_config(config_path: Path, user_config: Dict[str, Any]) -> None:
-    """Write only the user's raw config back (never the merged defaults)."""
+    """Write only the user's raw config back (never the merged defaults).
+
+    ``allow_collapse`` is correct here, not a bypass: this backs ``hermes config set/unset``, where
+    the caller IS the user and a single-key delete that empties its section is the explicit point.
+    The guard still fires for everything else, and the allowance is logged, not silent.
+    """
     ensure_hermes_home()
-    atomic_config_write(config_path, user_config)
+    atomic_config_write(config_path, user_config, allow_collapse="hermes config set/unset (user-requested key edit)")
 
 
 def _print_unknown_key_notice(key: str, suggestion: Optional[str]) -> None:
