@@ -8,6 +8,7 @@ silently replaced by the nested one. Both overwrite whatever legacy gateway.json
 
 import contextlib
 import json
+import dataclasses
 import logging
 import os
 from pathlib import Path
@@ -84,24 +85,49 @@ def _presence(*keys: str) -> tuple:
 
 
 # (yaml key, gw_data key, mode, accept(value) -> bool, transform(value))
-_TOPLEVEL_BRIDGE: tuple = (
+#
+# Hand-maintained rows are for keys that need a NON-default fallback mode or a
+# transform. Every other GatewayConfig field is derived from the dataclass below,
+# so adding a field to GatewayConfig can no longer leave the nested
+# ``gateway: <key>`` spelling silently dropped (#8389 shipped exactly that bug for
+# reply_gate_mode: a configured value resolved to the "prompt" default, the
+# tool-gated reply inversion never armed, and every intentional silence in a
+# free-response group was rewritten into a visible warning).
+#
+# The derived default is mode "presence" (top-level key wins; else the nested
+# ``gateway.<key>`` form), which is exactly what GatewayConfig.from_dict's own
+# ``pick()`` does for the flat form -- so a derived row and the dataclass cannot
+# disagree about precedence.
+_BRIDGE_OVERRIDES: tuple = (
     ("quick_commands", "quick_commands", "none", _quick_commands_ok, None),
     ("stt", "stt", "presence", lambda v: isinstance(v, dict), None),
-    *_presence("stt_echo_transcripts", "group_sessions_per_user", "thread_sessions_per_user"),
     ("multiplex_profiles", "multiplex_profiles", "gwdata", None, None),
-    *_presence("room_link_url"),
     ("profile_routes", "profile_routes", "none", lambda v: isinstance(v, list), None),
-    *_presence("max_concurrent_sessions"),
     ("systemd_watchdog_seconds", "systemd_watchdog_seconds", "nested", None, None),
     ("streaming", "streaming", "dict", None, None),
-    *_presence(
-        "reset_triggers", "always_log_local", "write_sessions_json", "loop_watchdog",
-        "loop_watchdog_probe_interval_s", "loop_watchdog_probe_timeout_s", "loop_watchdog_max_strikes",
-        "filter_silence_narration",
-    ),
     ("unauthorized_dm_behavior", "unauthorized_dm_behavior", "presence", None, _dm_behavior_choice),
     *_presence("unauthorized_dm_decline_message"),
 )
+
+# Keys the bridge must never claim. ``platforms`` is merged by
+# merge_platform_sections() from the nested block itself, and the *section* keys
+# are consumed as containers, not as GatewayConfig scalars.
+_BRIDGE_EXCLUDE: frozenset = frozenset({"platforms", "stt"})
+
+
+def _derived_presence_rows() -> tuple:
+    """A "presence" row per GatewayConfig field the overrides don't already cover."""
+    from gateway.config import GatewayConfig  # local: gateway.config imports this module
+
+    covered = {row[0] for row in _BRIDGE_OVERRIDES} | _BRIDGE_EXCLUDE
+    return tuple(
+        (f.name, f.name, "presence", None, None)
+        for f in dataclasses.fields(GatewayConfig)
+        if f.name not in covered
+    )
+
+
+_TOPLEVEL_BRIDGE: tuple = _BRIDGE_OVERRIDES + _derived_presence_rows()
 
 
 def _bridge_lookup(yaml_cfg: dict, gateway_section: Any, gw_data: dict, key: str, mode: str) -> tuple:
