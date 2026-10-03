@@ -58,6 +58,13 @@ EXCLUDED_DIR_PARTS = {
     "__pycache__",
 }
 
+# Virtualenvs at the REPO ROOT only. Matched by path part, so a bare "venv" would also prune an
+# unrelated nested source dir named venv; the checkout's own ``venv/`` holds installed packages
+# (mnemosyne_hermes does yaml.safe_load(config.yaml)) that are NOT repo source, and scanning them
+# made this guard fail on files no one can edit from here. Root-anchored: a nested ``venv/`` is
+# still scanned, exactly as before.
+_ROOT_VENV_DIRS = {"venv", ".venv"}
+
 # A safe_load within this many lines of a config.yaml reference is treated
 # as a raw user-config read.
 PROXIMITY = 6
@@ -79,7 +86,12 @@ def _iter_source_files():
     # The prune skips those trees. The onerror callback ignores a directory
     # that disappears anyway.
     for dirpath, dirnames, filenames in os.walk(REPO_ROOT, onerror=lambda _e: None):
-        dirnames[:] = [d for d in dirnames if d not in EXCLUDED_DIR_PARTS]
+        rel_dir = Path(dirpath).relative_to(REPO_ROOT)
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in EXCLUDED_DIR_PARTS
+            and not (not rel_dir.parts and d in _ROOT_VENV_DIRS)
+        ]
         for name in filenames:
             if not name.endswith(".py"):
                 continue
