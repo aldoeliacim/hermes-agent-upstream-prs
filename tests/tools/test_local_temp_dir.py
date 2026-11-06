@@ -79,41 +79,35 @@ def test_tmpdir_still_beats_default(tmp_path, monkeypatch):
     assert Path(env.get_temp_dir()) == tmp_path
 
 
-def test_cleanup_terminal_temp_cache(tmp_path, monkeypatch):
+def test_cleanup_terminal_temp_cache(tmp_path, monkeypatch, idle_clock):
     """Old artifacts are pruned; fresh ones and live bg groups survive."""
-    import time
-
     from tools.environments import local as local_mod
 
     root = tmp_path / "cache" / "terminal"
     root.mkdir(parents=True)
     monkeypatch.setattr(local_mod, "_default_terminal_temp_dir", lambda: root)
-
-    old = time.time() - 100 * 3600
-    fresh = time.time()
+    idle_clock.drive(local_mod)  # whatever the test writes is stale unless touched
 
     # Stale loose artifact — pruned.
     stale = root / "hermes-snap-deadbeef.sh"
     stale.write_text("x")
-    os.utime(stale, (old, old))
 
     # Fresh artifact — kept.
     keep = root / "hermes-snap-cafef00d.sh"
     keep.write_text("x")
+    idle_clock.touch(keep)
 
     # Live bg group: stale .pid but fresh .log — WHOLE group kept.
     live_pid = root / "hermes_bg_live1.pid"
     live_pid.write_text("123")
-    os.utime(live_pid, (old, old))
     live_log = root / "hermes_bg_live1.log"
     live_log.write_text("running")
-    os.utime(live_log, (fresh, fresh))
+    idle_clock.touch(live_log)
 
     # Dead bg group: everything stale — pruned.
     for suffix in ("log", "pid", "exit"):
         f = root / f"hermes_bg_dead1.{suffix}"
         f.write_text("x")
-        os.utime(f, (old, old))
 
     removed = local_mod.cleanup_terminal_temp_cache(max_age_hours=24)
     assert removed == 4  # stale snap + 3 dead-group files
@@ -123,25 +117,22 @@ def test_cleanup_terminal_temp_cache(tmp_path, monkeypatch):
     assert not (root / "hermes_bg_dead1.log").exists()
 
 
-def test_cleanup_terminal_temp_cache_revalidates_before_each_delete(tmp_path, monkeypatch):
+def test_cleanup_terminal_temp_cache_revalidates_before_each_delete(tmp_path, monkeypatch, idle_clock):
     """The age snapshot is a candidate list: a bg session whose .log is written after it
     keeps its remaining files, and a directory rmtree could not remove is not counted."""
     import pathlib
-    import time
 
     from tools.environments import local as local_mod
 
     root = tmp_path / "cache" / "terminal"
     root.mkdir(parents=True)
     monkeypatch.setattr(local_mod, "_default_terminal_temp_dir", lambda: root)
-    old = time.time() - 100 * 3600
+    idle_clock.drive(local_mod)  # whatever the test writes is stale unless touched
     for suffix in ("pid", "log", "exit"):
         f = root / f"hermes_bg_resumed.{suffix}"
         f.write_text("x")
-        os.utime(f, (old, old))
     stuck = root / "stuck-dir"
     stuck.mkdir()
-    os.utime(stuck, (old, old))
 
     real_unlink = pathlib.Path.unlink
 
@@ -152,6 +143,7 @@ def test_cleanup_terminal_temp_cache_revalidates_before_each_delete(tmp_path, mo
         if self.name.startswith("hermes_bg_resumed.") and not fired:
             fired.append(self.name)  # the session writes its log right after the first delete
             (root / "hermes_bg_resumed.log").write_text("RESUMED OUTPUT\n")
+            idle_clock.touch(root / "hermes_bg_resumed.log")  # written now, on the cleanup's clock
 
     monkeypatch.setattr(pathlib.Path, "unlink", unlink_then_session_writes)
     monkeypatch.setattr(local_mod.shutil, "rmtree", lambda *a, **k: None)
@@ -165,20 +157,18 @@ def test_cleanup_terminal_temp_cache_revalidates_before_each_delete(tmp_path, mo
     assert removed == len(set(fired) - {"hermes_bg_resumed.log"})  # never the stuck dir
 
 
-def test_cleanup_terminal_temp_cache_uninspectable_residue_is_not_counted(tmp_path, monkeypatch):
+def test_cleanup_terminal_temp_cache_uninspectable_residue_is_not_counted(tmp_path, monkeypatch, idle_clock):
     """An entry that survives its delete and cannot be lstat'd is not proven gone."""
     import pathlib
-    import time
 
     from tools.environments import local as local_mod
 
     root = tmp_path / "cache" / "terminal"
     root.mkdir(parents=True)
     monkeypatch.setattr(local_mod, "_default_terminal_temp_dir", lambda: root)
-    old = time.time() - 100 * 3600
+    idle_clock.drive(local_mod)
     residue = root / "residue.txt"
     residue.write_text("x")
-    os.utime(residue, (old, old))
 
     tried = []
     monkeypatch.setattr(pathlib.Path, "unlink", lambda self, *a, **k: tried.append(self))

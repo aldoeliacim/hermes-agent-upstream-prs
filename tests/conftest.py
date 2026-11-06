@@ -260,6 +260,7 @@ from tests._fixtures.live_system_guard import (
     _live_system_guard,
 )
 from tests._fixtures.model_peer import model_peer  # fixture registers here
+from tests._fixtures.idle_clock import idle_clock  # fixture registers here
 from tests._fixtures.platform_gating import _platforms_gate_reason, _reject_contradictory_platform_marks
 
 

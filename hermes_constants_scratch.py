@@ -104,12 +104,22 @@ _SCAN_FAILED = "scan-failed"
 _IDLE = "idle"
 
 
+def _changed_at(st: os.stat_result) -> float:
+    """When an inode last changed in any way: the later of its content (mtime) and its
+    metadata (ctime) timestamps. mtime alone is settable by any process, and every tool
+    that preserves it (``cp -p``/``-a``, ``rsync -a``, ``tar x``, ``unzip``, ``mv``) gives a
+    copy made a moment ago the source's old one; the kernel sets ctime when the inode is
+    created, renamed or changed, and no tool can move it into the past. (On Windows
+    ``st_ctime`` is the creation time, which a copy also gets fresh.)"""
+    return max(st.st_mtime, st.st_ctime)
+
+
 def subtree_touch_state(path: Path, cutoff: float) -> str:
-    """Tri-state form of :func:`subtree_touched_since`: ``touched`` (recent write seen),
+    """Tri-state form of :func:`subtree_touched_since`: ``touched`` (recent change seen),
     ``scan-failed`` (unreadable — idle cannot be established, so the entry is kept, but
     a failed scan is not activity and is never reported as such), or ``idle``.
     Same walk, same stop-at-first-recent shortcut, same symlink rules. A hardlinked file
-    (``st_nlink > 1``) does not count either: its mtime is the inode's, and
+    (``st_nlink > 1``) does not count either: its timestamps are the inode's, and
     ``git clone --local`` hardlinks packs that git freshens from the source repo."""
     return _scan_subtree(path, cutoff)[0]
 
@@ -118,7 +128,7 @@ def _scan_subtree(path: Path, cutoff: float) -> tuple[str, str | None]:
     """``(state, denied_dir)``: *denied_dir* is the directory below *path* that refused
     listing with EACCES/EPERM when that is why the scan failed (else None)."""
     try:
-        if os.lstat(path).st_mtime >= cutoff:
+        if _changed_at(os.lstat(path)) >= cutoff:
             return _TOUCHED, None
         if not path.is_dir() or path.is_symlink():
             return _IDLE, None
@@ -134,7 +144,7 @@ def _scan_subtree(path: Path, cutoff: float) -> tuple[str, str | None]:
                         st = child.stat(follow_symlinks=False)
                     except OSError as exc:
                         return _SCAN_FAILED, current if stuck.is_permission_error(exc) else None
-                    if st.st_mtime >= cutoff and not (st.st_nlink > 1 and child.is_file(follow_symlinks=False)):
+                    if _changed_at(st) >= cutoff and not (st.st_nlink > 1 and child.is_file(follow_symlinks=False)):
                         return _TOUCHED, None
                     if child.is_dir(follow_symlinks=False):
                         stack.append(child.path)
@@ -144,7 +154,7 @@ def _scan_subtree(path: Path, cutoff: float) -> tuple[str, str | None]:
 
 
 def subtree_touched_since(path: Path, cutoff: float) -> bool:
-    """True when *path* or anything beneath it has an mtime at or after *cutoff*.
+    """True when *path* or anything beneath it changed (mtime or ctime) at or after *cutoff*.
 
     Stops at the first recent entry, so a live tree costs one hit and only a truly idle
     tree pays for the full walk (once, right before it is deleted). Symlinks are never

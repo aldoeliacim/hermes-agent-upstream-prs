@@ -1,7 +1,6 @@
 """Cleanup needs a complete idle scan before deleting a scratch tree."""
 
 import os
-import time
 
 import pytest
 
@@ -9,15 +8,12 @@ import hermes_constants_scratch as scratch
 
 
 @pytest.mark.parametrize("failed_probe", ["root-stat", "directory-scan", "child-stat"])
-def test_unreadable_subtree_is_preserved_until_it_can_be_scanned(tmp_path, monkeypatch, failed_probe):
+def test_unreadable_subtree_is_preserved_until_it_can_be_scanned(tmp_path, monkeypatch, idle_clock, failed_probe):
     root = tmp_path / "scratch"
     entry = root / "lane"
     entry.mkdir(parents=True)
     result = entry / "result.txt"
     result.write_text("keep until activity can be checked", encoding="utf-8")
-    old = time.time() - 48 * 3600
-    os.utime(result, (old, old))
-    os.utime(entry, (old, old))
     # Process inspection is unrelated to determining whether the files are idle.
     monkeypatch.setattr(scratch, "reap_processes_rooted_in", lambda *_: 0)
     real_lstat, real_scandir = os.lstat, os.scandir
@@ -62,7 +58,7 @@ def test_unreadable_subtree_is_preserved_until_it_can_be_scanned(tmp_path, monke
 
 @pytest.mark.parametrize("failed_probe", ["root-stat", "directory-scan", "child-stat"])
 def test_post_selection_scan_failure_keeps_entry_with_honest_audit(
-    tmp_path, monkeypatch, failed_probe
+    tmp_path, monkeypatch, idle_clock, failed_probe
 ):
     """P3 on #134173: the mid-prune re-validation is a fail-closed keep, and its record
     must not dress a failed re-scan up as observed activity. Selection completes on a
@@ -74,9 +70,7 @@ def test_post_selection_scan_failure_keeps_entry_with_honest_audit(
     entry.mkdir(parents=True)
     result = entry / "result.txt"
     result.write_text("keep until activity can be checked", encoding="utf-8")
-    old = time.time() - 48 * 3600
-    os.utime(result, (old, old))
-    os.utime(entry, (old, old))
+    written = result.stat().st_mtime_ns
     log_file = tmp_path / "logs" / "scratch-prune.log"
 
     state = {"selected": False}
@@ -124,7 +118,7 @@ def test_post_selection_scan_failure_keeps_entry_with_honest_audit(
         # write occurred, and none may be invented by the audit.
         assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 0
         assert result.read_text(encoding="utf-8") == "keep until activity can be checked"
-        assert result.stat().st_mtime == old
+        assert result.stat().st_mtime_ns == written
     log = log_file.read_text(encoding="utf-8-sig")
     assert "touched since selection" not in log, log
     assert f"kept {str(entry)!r} " in log, log

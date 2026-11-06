@@ -21,7 +21,7 @@ from tests.waiting import wait_until
 
 @pytest.mark.platforms("linux")  # psutil's create_time adds the live /proc/stat btime only here
 @pytest.mark.parametrize("step", [5.0, -5.0])
-def test_prune_keeps_a_registered_gateways_shell_after_a_clock_step(tmp_path, monkeypatch, step):
+def test_prune_keeps_a_registered_gateways_shell_after_a_clock_step(tmp_path, monkeypatch, idle_clock, step):
     """A gateway registered in the spawn ledger runs a shell inside an idle scratch entry. The
     wall clock then steps by ``step`` seconds, which moves psutil's epoch ``create_time`` of every
     process on Linux. The gateway is still the same process: the prune must keep owning it, never
@@ -44,8 +44,6 @@ def test_prune_keeps_a_registered_gateways_shell_after_a_clock_step(tmp_path, mo
                                timeout=20, what="registered gateway started its shell"))
         real_btime = psutil.boot_time()
         monkeypatch.setattr(psutil._pslinux, "boot_time", lambda: real_btime + step)
-        ancient = time.time() - 30 * 3600
-        os.utime(lane, (ancient, ancient))
 
         prune_scratch_dir(scratch)
 
