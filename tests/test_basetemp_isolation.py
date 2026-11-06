@@ -82,10 +82,7 @@ def test_fallback_root_escapes_a_repo_checked_out_inside_the_native_home(tmp_pat
     assert relocated is not None and not relocated.resolve().is_relative_to(native.resolve())
 
 
-def test_relocation_root_sweeps_basetemps_of_killed_runs_and_keeps_live_ones(tmp_path, monkeypatch):
-    import os
-    import time
-
+def test_relocation_root_sweeps_basetemps_of_killed_runs_and_keeps_live_ones(tmp_path, monkeypatch, idle_clock):
     native = tmp_path / "native-home"
     native.mkdir()
     root = native.parent / "hermes-pytest"
@@ -94,8 +91,6 @@ def test_relocation_root_sweeps_basetemps_of_killed_runs_and_keeps_live_ones(tmp
     live.mkdir()
     (dead / "f").write_text("x", encoding="utf-8")
     (live / "f").write_text("x", encoding="utf-8")
-    ancient = time.time() - 30 * 3600
-    for p in (dead, dead / "f", live):
-        os.utime(p, (ancient, ancient))
+    idle_clock.touch(live / "f")  # the live run is still writing; the dead one stopped a day ago
     assert suite_conftest._pytest_disk_temp_root(native) == root
     assert not dead.exists() and live.exists()
